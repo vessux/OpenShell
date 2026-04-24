@@ -3,9 +3,9 @@
 
 //! Build script for openshell-driver-vm.
 //!
-//! This crate embeds the sandbox rootfs plus the minimal libkrun runtime
-//! artifacts it needs to boot base VMs without depending on the openshell-vm
-//! binary or crate.
+//! This crate embeds the sandbox supervisor plus the minimal libkrun runtime
+//! artifacts it needs to boot VMs without depending on the openshell-vm binary
+//! or crate.
 
 use std::path::PathBuf;
 use std::{env, fs};
@@ -21,7 +21,7 @@ fn main() {
             "libkrun.dylib.zst",
             "libkrunfw.5.dylib.zst",
             "gvproxy.zst",
-            "rootfs.tar.zst",
+            "openshell-sandbox.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
         }
@@ -36,7 +36,7 @@ fn main() {
         "linux" => ("libkrun.so", "libkrunfw.so.5"),
         _ => {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
-            generate_stub_resources(&out_dir, &["libkrun", "libkrunfw", "rootfs.tar.zst"]);
+            generate_stub_resources(&out_dir, &["libkrun", "libkrunfw", "openshell-sandbox.zst"]);
             return;
         }
     };
@@ -45,14 +45,14 @@ fn main() {
         PathBuf::from(dir)
     } else {
         println!("cargo:warning=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR not set");
-        println!("cargo:warning=Run: mise run vm:setup");
+        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
         generate_stub_resources(
             &out_dir,
             &[
                 &format!("{libkrun_name}.zst"),
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
-                "rootfs.tar.zst",
+                "openshell-sandbox.zst",
             ],
         );
         return;
@@ -63,14 +63,14 @@ fn main() {
             "cargo:warning=Compressed runtime dir not found: {}",
             compressed_dir.display()
         );
-        println!("cargo:warning=Run: mise run vm:setup");
+        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
         generate_stub_resources(
             &out_dir,
             &[
                 &format!("{libkrun_name}.zst"),
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
-                "rootfs.tar.zst",
+                "openshell-sandbox.zst",
             ],
         );
         return;
@@ -83,7 +83,10 @@ fn main() {
             format!("{libkrunfw_name}.zst"),
         ),
         ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
-        ("rootfs.tar.zst".to_string(), "rootfs.tar.zst".to_string()),
+        (
+            "openshell-sandbox.zst".to_string(),
+            "openshell-sandbox.zst".to_string(),
+        ),
     ];
 
     let mut all_found = true;
@@ -116,14 +119,16 @@ fn main() {
     }
 
     if !all_found {
-        println!("cargo:warning=Some artifacts missing. Run: mise run vm:setup");
+        println!(
+            "cargo:warning=Some artifacts missing. Run: mise run vm:setup && mise run vm:supervisor"
+        );
         generate_stub_resources(
             &out_dir,
             &[
                 &format!("{libkrun_name}.zst"),
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
-                "rootfs.tar.zst",
+                "openshell-sandbox.zst",
             ],
         );
     }

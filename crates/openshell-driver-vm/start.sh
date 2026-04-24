@@ -5,30 +5,70 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
 CLI_BIN="${ROOT}/scripts/bin/openshell"
-COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
-SERVER_PORT="${OPENSHELL_SERVER_PORT:-8080}"
-# Keep the driver socket path under AF_UNIX SUN_LEN on macOS.
+ENV_FILE="${ROOT}/.env"
+COMPRESSED_DIR_DEFAULT="${ROOT}/target/vm-runtime-compressed"
+COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR_DEFAULT}}"
+SERVER_PORT_REQUESTED="${OPENSHELL_SERVER_PORT:-${GATEWAY_PORT:-}}"
+SERVER_PORT="${SERVER_PORT_REQUESTED:-}"
 STATE_DIR_ROOT="${OPENSHELL_VM_DRIVER_STATE_ROOT:-/tmp}"
-STATE_LABEL_RAW="${OPENSHELL_VM_INSTANCE:-port-${SERVER_PORT}}"
-STATE_LABEL="$(printf '%s' "${STATE_LABEL_RAW}" | tr -cs '[:alnum:]._-' '-')"
-if [ -z "${STATE_LABEL}" ]; then
-    STATE_LABEL="port-${SERVER_PORT}"
-fi
-STATE_DIR_DEFAULT="${STATE_DIR_ROOT}/openshell-vm-driver-dev-${USER:-user}-${STATE_LABEL}"
-STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${STATE_DIR_DEFAULT}}"
-DB_PATH_DEFAULT="${STATE_DIR}/openshell.db"
 VM_HOST_GATEWAY_DEFAULT="${OPENSHELL_VM_HOST_GATEWAY:-host.containers.internal}"
-LOCAL_GATEWAY_ENDPOINT_DEFAULT="http://127.0.0.1:${SERVER_PORT}"
-LOCAL_GATEWAY_ENDPOINT="${OPENSHELL_VM_LOCAL_GATEWAY_ENDPOINT:-${LOCAL_GATEWAY_ENDPOINT_DEFAULT}}"
-GATEWAY_NAME_DEFAULT="vm-driver-${STATE_LABEL}"
-GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-${GATEWAY_NAME_DEFAULT}}"
 DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
 DRIVER_DIR="${OPENSHELL_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
 
-export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+normalize_name() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
 
-mkdir -p "${STATE_DIR}"
+has_env_key() {
+    local key=$1
+    [ -f "${ENV_FILE}" ] || return 1
+    grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "${ENV_FILE}"
+}
+
+append_env_if_missing() {
+    local key=$1
+    local value=$2
+    if has_env_key "${key}"; then
+        return
+    fi
+    if [ -f "${ENV_FILE}" ] && [ -s "${ENV_FILE}" ]; then
+        if [ "$(tail -c1 "${ENV_FILE}" | wc -l)" -eq 0 ]; then
+            printf "\n" >>"${ENV_FILE}"
+        fi
+    fi
+    printf "%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
+}
+
+upsert_env_key() {
+    local key=$1
+    local value=$2
+    local tmp_file
+
+    tmp_file="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+    if [ -f "${ENV_FILE}" ]; then
+        awk -v key="${key}" -v value="${value}" '
+            BEGIN { updated = 0 }
+            $0 ~ "^[[:space:]]*(export[[:space:]]+)?" key "=" {
+                if (!updated) {
+                    print key "=" value
+                    updated = 1
+                }
+                next
+            }
+            { print }
+            END {
+                if (!updated) {
+                    print key "=" value
+                }
+            }
+        ' "${ENV_FILE}" >"${tmp_file}"
+    else
+        printf "%s=%s\n" "${key}" "${value}" >"${tmp_file}"
+    fi
+    mv "${tmp_file}" "${ENV_FILE}"
+}
 
 normalize_bool() {
     case "${1,,}" in
@@ -39,6 +79,39 @@ normalize_bool() {
             exit 1
             ;;
     esac
+}
+
+port_is_in_use() {
+    local port=$1
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+
+    if command -v nc >/dev/null 2>&1; then
+        nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
+        return $?
+    fi
+
+    (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
+}
+
+pick_random_port() {
+    local lower=20000
+    local upper=60999
+    local attempts=256
+    local port
+
+    for _ in $(seq 1 "${attempts}"); do
+        port=$((RANDOM % (upper - lower + 1) + lower))
+        if ! port_is_in_use "${port}"; then
+            echo "${port}"
+            return 0
+        fi
+    done
+
+    echo "ERROR: could not find a free port after ${attempts} attempts." >&2
+    return 1
 }
 
 check_supervisor_cross_toolchain() {
@@ -73,15 +146,52 @@ check_supervisor_cross_toolchain() {
     fi
 }
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
-    check_supervisor_cross_toolchain
-    echo "==> Building base VM rootfs tarball"
-    mise run vm:rootfs -- --base
+if [ -n "${SERVER_PORT_REQUESTED}" ]; then
+    if port_is_in_use "${SERVER_PORT}"; then
+        echo "ERROR: requested gateway port ${SERVER_PORT} is already in use." >&2
+        echo "       Update .env GATEWAY_PORT or override it for one run:" >&2
+        echo "       OPENSHELL_SERVER_PORT=<free-port> mise run gateway:vm" >&2
+        exit 1
+    fi
+else
+    SERVER_PORT="$(pick_random_port)"
+    append_env_if_missing "GATEWAY_PORT" "${SERVER_PORT}"
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ] || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+GATEWAY_NAME_DEFAULT="$(basename "${ROOT}")"
+GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-${GATEWAY_NAME_DEFAULT}}"
+if [ -z "${GATEWAY_NAME}" ]; then
+    GATEWAY_NAME="openshell"
+fi
+
+# Keep the driver socket path under AF_UNIX SUN_LEN on macOS.
+STATE_LABEL_RAW="${OPENSHELL_VM_INSTANCE:-$(normalize_name "${GATEWAY_NAME}")}"
+STATE_LABEL="$(printf '%s' "${STATE_LABEL_RAW}" | tr -cs '[:alnum:]._-' '-')"
+if [ -z "${STATE_LABEL}" ]; then
+    STATE_LABEL="gateway"
+fi
+STATE_DIR_DEFAULT="${STATE_DIR_ROOT}/openshell-vm-driver-dev-${USER:-user}-${STATE_LABEL}"
+STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${STATE_DIR_DEFAULT}}"
+DB_PATH_DEFAULT="${STATE_DIR}/openshell.db"
+LOCAL_GATEWAY_ENDPOINT_DEFAULT="http://127.0.0.1:${SERVER_PORT}"
+LOCAL_GATEWAY_ENDPOINT="${OPENSHELL_VM_LOCAL_GATEWAY_ENDPOINT:-${LOCAL_GATEWAY_ENDPOINT_DEFAULT}}"
+
+export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${COMPRESSED_DIR}"
+export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+
+upsert_env_key "OPENSHELL_GATEWAY" "${GATEWAY_NAME}"
+
+mkdir -p "${STATE_DIR}"
+
+if [ ! -d "${COMPRESSED_DIR}" ] || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ]; then
     echo "==> Preparing embedded VM runtime"
     mise run vm:setup
+fi
+
+if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+    check_supervisor_cross_toolchain
+    echo "==> Building bundled VM supervisor"
+    mise run vm:supervisor
 fi
 
 echo "==> Building gateway and VM compute driver"
@@ -100,18 +210,35 @@ export OPENSHELL_DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")
 export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${DB_PATH_DEFAULT}}"
 export OPENSHELL_DRIVERS="${OPENSHELL_DRIVERS:-vm}"
 export OPENSHELL_DRIVER_DIR="${DRIVER_DIR}"
+export OPENSHELL_SERVER_PORT="${SERVER_PORT}"
 export OPENSHELL_GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://${VM_HOST_GATEWAY_DEFAULT}:${SERVER_PORT}}"
+export OPENSHELL_SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-}}"
 export OPENSHELL_SSH_GATEWAY_HOST="${OPENSHELL_SSH_GATEWAY_HOST:-127.0.0.1}"
 export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-${SERVER_PORT}}"
 export OPENSHELL_SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-dev-vm-driver-secret}"
 export OPENSHELL_VM_DRIVER_STATE_DIR="${STATE_DIR}"
 
-echo "==> Gateway registration"
+GATEWAY_METADATA_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/openshell/gateways/${GATEWAY_NAME}"
+mkdir -p "${GATEWAY_METADATA_DIR}"
+cat >"${GATEWAY_METADATA_DIR}/metadata.json" <<EOF
+{
+  "name": "${GATEWAY_NAME}",
+  "gateway_endpoint": "${LOCAL_GATEWAY_ENDPOINT}",
+  "is_remote": false,
+  "gateway_port": ${SERVER_PORT},
+  "auth_mode": "plaintext"
+}
+EOF
+
+echo "==> Gateway config"
 echo "    Name: ${GATEWAY_NAME}"
 echo "    Endpoint: ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Register: ${CLI_BIN} gateway add --name ${GATEWAY_NAME} ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Select:   ${CLI_BIN} gateway select ${GATEWAY_NAME}"
+echo "    .env:     OPENSHELL_GATEWAY=${GATEWAY_NAME}"
+echo "    .env:     GATEWAY_PORT=${SERVER_PORT}"
 echo "    Driver:   ${OPENSHELL_DRIVER_DIR}/openshell-driver-vm"
+echo "    Image:    ${OPENSHELL_SANDBOX_IMAGE}"
+echo "    Status:   ${CLI_BIN} status"
+echo "    Create:   ${CLI_BIN} sandbox create --name vm-test --from ubuntu:24.04"
 
 echo "==> Starting OpenShell server with VM compute driver"
 exec "${ROOT}/target/debug/openshell-gateway"
