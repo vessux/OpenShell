@@ -36,6 +36,8 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Per-endpoint credential strip/inject configuration.
+    pub(crate) cred_inject: Option<super::CredInjectConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,6 +318,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 Some(engine.generation_guard()),
+                ctx.cred_inject.as_ref(),
             )
             .await?;
             match outcome {
@@ -556,6 +559,7 @@ where
             upstream,
             resolver,
             Some(generation_guard),
+            None,
         )
         .await?;
 

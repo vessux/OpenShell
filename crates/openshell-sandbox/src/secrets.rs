@@ -51,6 +51,13 @@ pub struct RewriteResult {
     pub redacted_target: Option<String>,
 }
 
+/// Directive to strip one header and inject a replacement from the credential resolver.
+#[derive(Debug, Clone)]
+pub(crate) struct CredInjectDirective {
+    pub header: String,
+    pub from_credential: String,
+}
+
 /// Result of rewriting a request target for OPA evaluation.
 #[derive(Debug)]
 pub struct RewriteTargetResult {
@@ -106,6 +113,15 @@ impl SecretResolver {
                 None
             }
         }
+    }
+
+    /// Resolve a credential by its environment variable key name (e.g. `"ANTHROPIC_API_KEY"`).
+    ///
+    /// Builds the canonical placeholder and delegates to `resolve_placeholder`.
+    /// Returns `None` if the key is unknown or the value is invalid.
+    pub(crate) fn resolve_by_env_key(&self, key: &str) -> Option<&str> {
+        let placeholder = placeholder_for_env_key(key);
+        self.resolve_placeholder(&placeholder)
     }
 
     pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
@@ -702,6 +718,99 @@ pub fn rewrite_target_for_eval(
     };
 
     Ok(RewriteTargetResult { resolved, redacted })
+}
+
+// ---------------------------------------------------------------------------
+// Credential inject (strip-and-replace pass)
+// ---------------------------------------------------------------------------
+
+/// Strip named headers and inject replacements from the credential resolver.
+///
+/// This is a second-pass operation applied **after** `rewrite_http_header_block`.
+/// It unconditionally removes headers whose names appear in `strip_headers` and
+/// appends new headers sourced from the resolver using `inject` directives.
+///
+/// # Fail-closed
+///
+/// If any inject directive references a credential that cannot be resolved,
+/// the function returns `Err(UnresolvedPlaceholderError { location: "cred_inject" })`
+/// rather than forwarding a request with a missing or placeholder credential.
+///
+/// # No-op fast path
+///
+/// If both `strip_headers` and `inject` are empty, the input is returned unchanged.
+pub(crate) fn apply_cred_inject(
+    raw: &[u8],
+    strip_headers: &[String],
+    inject: &[CredInjectDirective],
+    resolver: &SecretResolver,
+) -> Result<Vec<u8>, UnresolvedPlaceholderError> {
+    // Fast path: nothing to do.
+    if strip_headers.is_empty() && inject.is_empty() {
+        return Ok(raw.to_vec());
+    }
+
+    // Locate the end of the header block (\r\n\r\n).
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+        return Ok(raw.to_vec());
+    };
+
+    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = header_str.split("\r\n");
+
+    // Preserve the request line verbatim.
+    let Some(request_line) = lines.next() else {
+        return Ok(raw.to_vec());
+    };
+
+    // Pre-resolve all inject directives up front (fail-closed).
+    let mut resolved_injections: Vec<(&str, &str)> = Vec::with_capacity(inject.len());
+    for directive in inject {
+        let value = resolver
+            .resolve_by_env_key(&directive.from_credential)
+            .ok_or(UnresolvedPlaceholderError {
+                location: "cred_inject",
+            })?;
+        resolved_injections.push((&directive.header, value));
+    }
+
+    let mut output = Vec::with_capacity(raw.len() + inject.len() * 64);
+    output.extend_from_slice(request_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Copy headers, skipping those in the strip list (case-insensitive).
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, _)) = line.split_once(':') {
+            let name_lower = name.trim().to_ascii_lowercase();
+            if strip_headers
+                .iter()
+                .any(|h| h.to_ascii_lowercase() == name_lower)
+            {
+                continue;
+            }
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    // Append injected headers.
+    for (header, value) in &resolved_injections {
+        output.extend_from_slice(header.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    // Terminate the header block.
+    output.extend_from_slice(b"\r\n");
+
+    // Append any body bytes that followed the header block.
+    output.extend_from_slice(&raw[header_end..]);
+
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,5 +1599,179 @@ mod tests {
 
         assert_eq!(result.resolved, "/bottok123/method?key=key456");
         assert_eq!(result.redacted, "/bot[CREDENTIAL]/method?key=[CREDENTIAL]");
+    }
+
+    // === resolve_by_env_key tests ===
+
+    #[test]
+    fn resolve_by_env_key_returns_secret() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("ANTHROPIC_API_KEY".to_string(), "sk-real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            resolver.resolve_by_env_key("ANTHROPIC_API_KEY"),
+            Some("sk-real")
+        );
+        assert_eq!(resolver.resolve_by_env_key("UNKNOWN_KEY"), None);
+    }
+
+    // === apply_cred_inject tests ===
+
+    #[test]
+    fn apply_cred_inject_strips_and_injects() {
+        // Provider has the real key; agent environment carries the placeholder.
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-provider-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let agent_placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+
+        // Agent sends both an Authorization header (leaked placeholder) and an
+        // x-api-key header.  Both should be stripped and replaced by the
+        // injected provider key.
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Authorization: Bearer {agent_placeholder}\r\n\
+             x-api-key: {agent_placeholder}\r\n\
+             Content-Type: application/json\r\n\r\n"
+        );
+
+        let strip = vec!["Authorization".to_string(), "x-api-key".to_string()];
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".to_string(),
+            from_credential: "ANTHROPIC_API_KEY".to_string(),
+        }];
+
+        let result =
+            apply_cred_inject(raw.as_bytes(), &strip, &inject, &resolver).expect("should succeed");
+        let rewritten = String::from_utf8(result).expect("utf8");
+
+        // Request line preserved
+        assert!(rewritten.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        // Both stripped headers gone
+        assert!(!rewritten.contains("Authorization:"));
+        assert!(!rewritten.contains(&format!("x-api-key: {agent_placeholder}")));
+        // Injected header present with real value
+        assert!(rewritten.contains("x-api-key: sk-provider-key\r\n"));
+        // Unrelated header preserved
+        assert!(rewritten.contains("Content-Type: application/json\r\n"));
+        // No placeholder leakage
+        assert!(!rewritten.contains("openshell:resolve:env:"));
+    }
+
+    #[test]
+    fn apply_cred_inject_case_insensitive_strip() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        // Config strip list uses lowercase; request sends mixed-case header.
+        let raw = b"GET / HTTP/1.1\r\nX-Api-Key: some-value\r\nAccept: */*\r\n\r\n";
+        let strip = vec!["x-api-key".to_string()];
+
+        let result = apply_cred_inject(raw, &strip, &[], &resolver).expect("should succeed");
+        let rewritten = String::from_utf8(result).expect("utf8");
+
+        assert!(
+            !rewritten.contains("X-Api-Key:"),
+            "Mixed-case header should be stripped"
+        );
+        assert!(
+            rewritten.contains("Accept: */*\r\n"),
+            "Unrelated header should survive"
+        );
+    }
+
+    #[test]
+    fn apply_cred_inject_fails_on_missing_credential() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("EXISTING_KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".to_string(),
+            from_credential: "NONEXISTENT_KEY".to_string(),
+        }];
+
+        let result = apply_cred_inject(raw, &[], &inject, &resolver);
+        assert!(result.is_err(), "Missing credential should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.location, "cred_inject");
+    }
+
+    #[test]
+    fn apply_cred_inject_no_op_when_empty() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = apply_cred_inject(raw, &[], &[], &resolver).expect("should succeed");
+
+        assert_eq!(
+            raw.as_slice(),
+            result.as_slice(),
+            "Output should equal input when no-op"
+        );
+    }
+
+    // === Integration test: end-to-end strip-and-replace pipeline ===
+
+    #[test]
+    fn cred_inject_overrides_placeholder_rewriting() {
+        // Setup: provider env creates placeholders
+        let env = HashMap::from([("ANTHROPIC_API_KEY".into(), "sk-real-provider-key".into())]);
+        let (child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        // Agent sends request with the placeholder (normal flow)
+        let placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: api.anthropic.com\r\n\
+             x-api-key: {placeholder}\r\n\
+             Authorization: Bearer smuggled-token\r\n\
+             Content-Type: application/json\r\n\
+             \r\n"
+        );
+
+        // Step 1: normal placeholder rewriting (existing behavior)
+        let rewrite_result = rewrite_http_header_block(raw.as_bytes(), Some(&resolver)).unwrap();
+
+        // Step 2: cred_inject strips and re-injects
+        let strip = vec!["x-api-key".to_string(), "Authorization".to_string()];
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".into(),
+            from_credential: "ANTHROPIC_API_KEY".into(),
+        }];
+        let final_result =
+            apply_cred_inject(&rewrite_result.rewritten, &strip, &inject, &resolver).unwrap();
+
+        let output = String::from_utf8_lossy(&final_result);
+        // Real key injected by cred_inject
+        assert!(output.contains("x-api-key: sk-real-provider-key"));
+        // Smuggled Authorization stripped
+        assert!(!output.contains("smuggled-token"));
+        // Other headers preserved
+        assert!(output.contains("Content-Type: application/json"));
     }
 }

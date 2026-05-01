@@ -326,7 +326,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -334,6 +334,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -348,6 +349,7 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
+    cred_inject: Option<&crate::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -362,14 +364,26 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
+    let empty_resolver = crate::secrets::SecretResolver::default();
+    let final_header = match cred_inject {
+        Some(ci) if !ci.strip_headers.is_empty() || !ci.inject.is_empty() => {
+            let resolver = resolver.unwrap_or(&empty_resolver);
+            crate::secrets::apply_cred_inject(
+                &rewrite_result.rewritten,
+                &ci.strip_headers,
+                &ci.inject,
+                resolver,
+            )
+            .map_err(|e| miette!("cred_inject failed: {e}"))?
+        }
+        _ => rewrite_result.rewritten,
+    };
+
     if let Some(guard) = generation_guard {
         guard.ensure_current()?;
     }
 
-    upstream
-        .write_all(&rewrite_result.rewritten)
-        .await
-        .into_diagnostic()?;
+    upstream.write_all(&final_header).await.into_diagnostic()?;
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
@@ -1927,6 +1941,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -1983,6 +1998,7 @@ mod tests {
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
+                None,
                 None,
             ),
         )
@@ -2150,6 +2166,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
             ),
         )
         .await
@@ -2234,6 +2251,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
             ),
         )
         .await
@@ -2322,6 +2340,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver,
+                None,
             ),
         )
         .await

@@ -731,6 +731,7 @@ async fn handle_tcp_connection(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
     };
 
     if effective_tls_skip {
@@ -1695,6 +1696,51 @@ fn query_l7_route_snapshot(
     }
 }
 
+/// Query cred_inject config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(CredInjectConfig)` if the matched endpoint has cred_inject config,
+/// `None` otherwise.
+fn query_cred_inject_config(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::CredInjectConfig> {
+    // Only query if action is Allow (not Deny)
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_cred_inject_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query cred_inject endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
 /// Query the TLS mode for an endpoint, independent of L7 config.
 ///
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
@@ -2600,6 +2646,7 @@ async fn handle_forward_proxy(
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             secret_resolver: secret_resolver.clone(),
+            cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA

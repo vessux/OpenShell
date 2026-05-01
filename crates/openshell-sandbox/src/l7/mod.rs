@@ -85,6 +85,17 @@ pub struct L7RequestInfo {
     pub query_params: std::collections::HashMap<String, Vec<String>>,
 }
 
+/// Credential injection configuration for an endpoint.
+///
+/// Specifies which request headers to strip and which credentials to inject
+/// in their place. Independent of L7 protocol — an endpoint can have
+/// `cred_inject` without a `protocol: rest` field.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CredInjectConfig {
+    pub(crate) strip_headers: Vec<String>,
+    pub(crate) inject: Vec<crate::secrets::CredInjectDirective>,
+}
+
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
 ///
 /// The value is expected to be the raw endpoint object from the Rego data,
@@ -146,6 +157,77 @@ pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
         Some("skip") => TlsMode::Skip,
         // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+/// Parse the `cred_inject` config block from a regorus endpoint value.
+///
+/// Extracts the `cred_inject` object from an endpoint config and returns
+/// a `CredInjectConfig` describing which headers to strip and which
+/// credentials to inject.
+///
+/// Returns `None` if the endpoint has no `cred_inject` field, or if both
+/// `strip_headers` and `inject` are empty after parsing.
+pub(crate) fn parse_cred_inject_config(val: &regorus::Value) -> Option<CredInjectConfig> {
+    let ci = get_object_val(val, "cred_inject")?;
+
+    let strip_headers = get_str_array(ci, "strip_headers");
+    let inject = get_inject_array(ci, "inject");
+
+    if strip_headers.is_empty() && inject.is_empty() {
+        return None;
+    }
+
+    Some(CredInjectConfig {
+        strip_headers,
+        inject,
+    })
+}
+
+/// Extract a raw `&regorus::Value` from an object by key.
+fn get_object_val<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    val.as_object().ok()?.get(&regorus::Value::from(key))
+}
+
+/// Extract an array of strings from a regorus object field.
+fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
+    let Some(arr_val) = get_object_val(val, key) else {
+        return Vec::new();
+    };
+    match arr_val {
+        regorus::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| {
+                if let regorus::Value::String(s) = v {
+                    let s = s.to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract an array of `CredInjectDirective` from a regorus object field.
+fn get_inject_array(val: &regorus::Value, key: &str) -> Vec<crate::secrets::CredInjectDirective> {
+    let Some(arr_val) = get_object_val(val, key) else {
+        return Vec::new();
+    };
+    match arr_val {
+        regorus::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                let header = get_object_str(item, "header")?;
+                let from_credential = get_object_str(item, "from_credential")?;
+                Some(crate::secrets::CredInjectDirective {
+                    header,
+                    from_credential,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1557,5 +1639,107 @@ mod tests {
             errors.is_empty(),
             "valid deny query matchers should not error: {errors:?}"
         );
+    }
+
+    // --- parse_cred_inject_config tests ---
+
+    #[test]
+    fn parse_cred_inject_config_full() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+            "host": "api.example.com",
+            "port": 443,
+            "cred_inject": {
+                "strip_headers": ["Authorization", "x-api-key"],
+                "inject": [
+                    {"header": "x-api-key", "from_credential": "ANTHROPIC_API_KEY"}
+                ]
+            }
+        }"#,
+        )
+        .unwrap();
+        let config = parse_cred_inject_config(&val).unwrap();
+        assert_eq!(config.strip_headers, vec!["Authorization", "x-api-key"]);
+        assert_eq!(config.inject.len(), 1);
+        assert_eq!(config.inject[0].header, "x-api-key");
+        assert_eq!(config.inject[0].from_credential, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn parse_cred_inject_config_missing_returns_none() {
+        let val =
+            regorus::Value::from_json_str(r#"{"host": "api.example.com", "port": 443}"#).unwrap();
+        assert!(parse_cred_inject_config(&val).is_none());
+    }
+
+    #[test]
+    fn parse_cred_inject_config_empty_both_returns_none() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+            "host": "api.example.com",
+            "port": 443,
+            "cred_inject": {
+                "strip_headers": [],
+                "inject": []
+            }
+        }"#,
+        )
+        .unwrap();
+        assert!(parse_cred_inject_config(&val).is_none());
+    }
+
+    #[test]
+    fn parse_cred_inject_config_strip_headers_only() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+            "cred_inject": {
+                "strip_headers": ["Authorization"],
+                "inject": []
+            }
+        }"#,
+        )
+        .unwrap();
+        let config = parse_cred_inject_config(&val).unwrap();
+        assert_eq!(config.strip_headers, vec!["Authorization"]);
+        assert!(config.inject.is_empty());
+    }
+
+    #[test]
+    fn parse_cred_inject_config_inject_only() {
+        let val = regorus::Value::from_json_str(
+            r#"{
+            "cred_inject": {
+                "inject": [
+                    {"header": "Authorization", "from_credential": "MY_TOKEN"}
+                ]
+            }
+        }"#,
+        )
+        .unwrap();
+        let config = parse_cred_inject_config(&val).unwrap();
+        assert!(config.strip_headers.is_empty());
+        assert_eq!(config.inject.len(), 1);
+        assert_eq!(config.inject[0].header, "Authorization");
+        assert_eq!(config.inject[0].from_credential, "MY_TOKEN");
+    }
+
+    #[test]
+    fn parse_cred_inject_config_skips_incomplete_inject_entries() {
+        // Entries missing "header" or "from_credential" are silently skipped.
+        let val = regorus::Value::from_json_str(
+            r#"{
+            "cred_inject": {
+                "inject": [
+                    {"header": "x-api-key"},
+                    {"from_credential": "SOME_KEY"},
+                    {"header": "Authorization", "from_credential": "FULL_TOKEN"}
+                ]
+            }
+        }"#,
+        )
+        .unwrap();
+        let config = parse_cred_inject_config(&val).unwrap();
+        assert_eq!(config.inject.len(), 1);
+        assert_eq!(config.inject[0].header, "Authorization");
     }
 }

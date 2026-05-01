@@ -17,8 +17,9 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    CredInjectConfig, CredInjectHeader, FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher,
+    L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +116,28 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    /// Optional credential injection config. When present, the L7 proxy strips
+    /// the specified headers and injects provider-managed credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cred_inject: Option<CredInjectDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strip_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inject: Vec<CredInjectHeaderDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectHeaderDef {
+    header: String,
+    from_credential: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -270,6 +293,18 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            cred_inject: e.cred_inject.map(|ci| CredInjectConfig {
+                                provider: ci.provider,
+                                strip_headers: ci.strip_headers,
+                                inject: ci
+                                    .inject
+                                    .into_iter()
+                                    .map(|h| CredInjectHeader {
+                                        header: h.header,
+                                        from_credential: h.from_credential,
+                                    })
+                                    .collect(),
+                            }),
                         }
                     })
                     .collect(),
@@ -410,6 +445,18 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            cred_inject: e.cred_inject.as_ref().map(|ci| CredInjectDef {
+                                provider: ci.provider.clone(),
+                                strip_headers: ci.strip_headers.clone(),
+                                inject: ci
+                                    .inject
+                                    .iter()
+                                    .map(|h| CredInjectHeaderDef {
+                                        header: h.header.clone(),
+                                        from_credential: h.from_credential.clone(),
+                                    })
+                                    .collect(),
+                            }),
                         }
                     })
                     .collect(),
@@ -1522,5 +1569,56 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn cred_inject_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  anthropic_strict:
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        cred_inject:
+          provider: anthropic-prod
+          strip_headers:
+            - Authorization
+            - x-api-key
+            - Cookie
+          inject:
+            - header: x-api-key
+              from_credential: ANTHROPIC_API_KEY
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["anthropic_strict"].endpoints[0];
+
+        let ci = ep.cred_inject.as_ref().expect("cred_inject should be set");
+        assert_eq!(ci.provider, "anthropic-prod");
+        assert_eq!(
+            ci.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci.inject.len(), 1);
+        assert_eq!(ci.inject[0].header, "x-api-key");
+        assert_eq!(ci.inject[0].from_credential, "ANTHROPIC_API_KEY");
+
+        // Round-trip: serialize back to YAML and re-parse.
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep2 = &proto2.network_policies["anthropic_strict"].endpoints[0];
+        let ci2 = ep2
+            .cred_inject
+            .as_ref()
+            .expect("cred_inject should survive round-trip");
+        assert_eq!(ci2.provider, "anthropic-prod");
+        assert_eq!(
+            ci2.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci2.inject.len(), 1);
+        assert_eq!(ci2.inject[0].header, "x-api-key");
+        assert_eq!(ci2.inject[0].from_credential, "ANTHROPIC_API_KEY");
     }
 }
