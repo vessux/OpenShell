@@ -821,6 +821,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -839,6 +840,7 @@ mod tests {
                 path: "/usr/bin/gh".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let result = merge_policy(
@@ -979,6 +981,7 @@ mod tests {
                     path: "/usr/bin/gh".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 

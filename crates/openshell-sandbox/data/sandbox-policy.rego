@@ -426,6 +426,14 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
+# Return the allowed_secrets list from the matched network policy rule.
+# Empty list (or absent field) means all credentials are allowed.
+matched_allowed_secrets := secrets if {
+	matched_network_policy
+	policy := data.network_policies[matched_network_policy]
+	secrets := object.get(policy, "allowed_secrets", [])
+}
+
 # Hosted endpoint: exact host match + port in ports list.
 endpoint_matches_request(ep, network) if {
 	not contains(ep.host, "*")

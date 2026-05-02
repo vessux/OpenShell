@@ -59,6 +59,9 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
+  // Credential keys this policy's binaries are allowed to resolve.
+  // When empty, all credentials are resolvable (backward compatible).
+  repeated string allowed_secrets = 4;
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.

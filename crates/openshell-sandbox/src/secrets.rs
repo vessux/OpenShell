@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
@@ -122,6 +122,27 @@ impl SecretResolver {
     pub(crate) fn resolve_by_env_key(&self, key: &str) -> Option<&str> {
         let placeholder = placeholder_for_env_key(key);
         self.resolve_placeholder(&placeholder)
+    }
+
+    /// Create a new resolver containing only the specified credential keys.
+    /// If `allowed_keys` is empty, returns a clone with all credentials
+    /// (backward compatible — empty means "no restriction").
+    pub(crate) fn filtered(&self, allowed_keys: &[String]) -> Self {
+        if allowed_keys.is_empty() {
+            return self.clone();
+        }
+        let allowed_placeholders: HashSet<String> = allowed_keys
+            .iter()
+            .map(|k| placeholder_for_env_key(k))
+            .collect();
+        Self {
+            by_placeholder: self
+                .by_placeholder
+                .iter()
+                .filter(|(k, _)| allowed_placeholders.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
     }
 
     pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
@@ -1619,6 +1640,49 @@ mod tests {
         assert_eq!(resolver.resolve_by_env_key("UNKNOWN_KEY"), None);
     }
 
+    // === filtered resolver tests ===
+
+    #[test]
+    fn filtered_resolver_only_resolves_allowed_keys() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+            ("NPM_TOKEN".into(), "npm-789".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        let filtered = resolver.filtered(&["GITHUB_TOKEN".to_string()]);
+
+        assert_eq!(
+            filtered.resolve_by_env_key("GITHUB_TOKEN"),
+            Some("ghp-github-456")
+        );
+        assert_eq!(filtered.resolve_by_env_key("ANTHROPIC_API_KEY"), None);
+        assert_eq!(filtered.resolve_by_env_key("NPM_TOKEN"), None);
+    }
+
+    #[test]
+    fn filtered_resolver_empty_allows_all() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        let filtered = resolver.filtered(&[]);
+
+        assert_eq!(
+            filtered.resolve_by_env_key("ANTHROPIC_API_KEY"),
+            Some("sk-anthropic-123")
+        );
+        assert_eq!(
+            filtered.resolve_by_env_key("GITHUB_TOKEN"),
+            Some("ghp-github-456")
+        );
+    }
+
     // === apply_cred_inject tests ===
 
     #[test]
@@ -1732,6 +1796,45 @@ mod tests {
             result.as_slice(),
             "Output should equal input when no-op"
         );
+    }
+
+    // === Integration test: per-binary credential scoping ===
+
+    #[test]
+    fn filtered_resolver_blocks_cred_inject_for_wrong_binary() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        // Simulate: gh binary can only use GITHUB_TOKEN
+        let gh_resolver = resolver.filtered(&["GITHUB_TOKEN".to_string()]);
+
+        // gh tries to inject ANTHROPIC_API_KEY via cred_inject → should fail
+        let raw = b"GET /repos HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        let inject = vec![
+            CredInjectDirective {
+                header: "x-api-key".into(),
+                from_credential: "ANTHROPIC_API_KEY".into(),
+            },
+        ];
+        let result = apply_cred_inject(raw, &[], &inject, &gh_resolver);
+        assert!(result.is_err(), "gh should not resolve ANTHROPIC_API_KEY");
+
+        // gh tries to inject GITHUB_TOKEN → should succeed
+        let inject_github = vec![
+            CredInjectDirective {
+                header: "Authorization".into(),
+                from_credential: "GITHUB_TOKEN".into(),
+            },
+        ];
+        let result = apply_cred_inject(raw, &[], &inject_github, &gh_resolver);
+        assert!(result.is_ok());
+        let bytes = result.unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains("Authorization: ghp-github-456"));
     }
 
     // === Integration test: end-to-end strip-and-replace pipeline ===

@@ -730,7 +730,13 @@ async fn handle_tcp_connection(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
-        secret_resolver: secret_resolver.clone(),
+        secret_resolver: filter_resolver_by_policy(
+            &opa_engine,
+            &decision,
+            &host_lc,
+            port,
+            &secret_resolver,
+        ),
         cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
     };
 
@@ -1741,6 +1747,55 @@ fn query_cred_inject_config(
     }
 }
 
+/// Query OPA for `allowed_secrets` and return a filtered `SecretResolver`.
+///
+/// If the matched policy has no `allowed_secrets` constraint (or the list is
+/// empty), the full resolver is returned unchanged so the behaviour is
+/// backward-compatible.  On OPA error the full resolver is also returned and
+/// the failure is emitted as an OCSF event.
+fn filter_resolver_by_policy(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+    resolver: &Option<Arc<SecretResolver>>,
+) -> Option<Arc<SecretResolver>> {
+    let resolver = resolver.as_ref()?;
+
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return Some(Arc::clone(resolver));
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_allowed_secrets(&input) {
+        Ok(allowed) if !allowed.is_empty() => Some(Arc::new(resolver.filtered(&allowed))),
+        Ok(_) => Some(Arc::clone(resolver)),
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query allowed_secrets: {e}"))
+                .build();
+            ocsf_emit!(event);
+            Some(Arc::clone(resolver))
+        }
+    }
+}
+
 /// Query the TLS mode for an endpoint, independent of L7 config.
 ///
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
@@ -2645,7 +2700,13 @@ async fn handle_forward_proxy(
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            secret_resolver: secret_resolver.clone(),
+            secret_resolver: filter_resolver_by_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+                &secret_resolver,
+            ),
             cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
         };
 

@@ -547,6 +547,57 @@ impl OpaEngine {
             .unwrap_or_default())
     }
 
+    /// Query `matched_allowed_secrets` from the OPA policy for a given request.
+    ///
+    /// Returns the list of credential key names that the binary is allowed to
+    /// access, or an empty vec if the rule is undefined or returns no values.
+    /// Used by the proxy to scope `SecretResolver` to only the permitted keys.
+    pub fn query_allowed_secrets(&self, input: &NetworkInput) -> Result<Vec<String>> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.matched_allowed_secrets".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Array(arr) => Ok(arr
+                .iter()
+                .filter_map(|v| v.as_string().ok().map(|s| s.to_string()))
+                .collect()),
+            regorus::Value::Undefined => Ok(vec![]),
+            _ => Ok(vec![]),
+        }
+    }
+
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
     ///
     /// With the `arc` feature enabled, this shares compiled policy via Arc
@@ -1113,6 +1164,7 @@ mod tests {
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         network_policies.insert(
@@ -1128,6 +1180,7 @@ mod tests {
                     path: "/usr/bin/glab".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         ProtoSandboxPolicy {
@@ -1964,6 +2017,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -2980,6 +3034,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3210,6 +3265,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3850,6 +3906,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -4087,6 +4144,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4164,6 +4222,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {

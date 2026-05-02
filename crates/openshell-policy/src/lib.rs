@@ -82,6 +82,8 @@ struct NetworkPolicyRuleDef {
     endpoints: Vec<NetworkEndpointDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binaries: Vec<NetworkBinaryDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_secrets: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -316,6 +318,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         ..Default::default()
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets,
             };
             (key, proto_rule)
         })
@@ -468,6 +471,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         harness: false,
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets.clone(),
             };
             (key.clone(), yaml_rule)
         })
@@ -1568,6 +1572,32 @@ network_policies:
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
+        );
+    }
+
+    #[test]
+    fn allowed_secrets_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github_only:
+    binaries:
+      - path: /usr/bin/gh
+    endpoints:
+      - host: api.github.com
+        port: 443
+    allowed_secrets:
+      - GITHUB_TOKEN
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let rule = &proto.network_policies["github_only"];
+        assert_eq!(rule.allowed_secrets, vec!["GITHUB_TOKEN"]);
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto2.network_policies["github_only"].allowed_secrets,
+            vec!["GITHUB_TOKEN"]
         );
     }
 
