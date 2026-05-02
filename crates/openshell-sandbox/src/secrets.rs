@@ -1877,4 +1877,76 @@ mod tests {
         // Other headers preserved
         assert!(output.contains("Content-Type: application/json"));
     }
+
+    // === ArcSwapOption live-reload tests ===
+
+    #[test]
+    fn arcswap_resolver_hot_swap_updates_credentials() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let env = HashMap::from([("API_KEY".into(), "old-secret".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        let shared = Arc::new(ArcSwapOption::from(resolver.map(Arc::new)));
+
+        // Connection 1 sees the old secret.
+        let snap1: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap1.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("old-secret")
+        );
+
+        // Simulate provider poll: credentials rotate.
+        let new_env = HashMap::from([("API_KEY".into(), "new-secret".into())]);
+        let (_, new_resolver) = SecretResolver::from_provider_env(new_env);
+        shared.store(new_resolver.map(Arc::new));
+
+        // Connection 2 sees the new secret.
+        let snap2: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap2.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("new-secret")
+        );
+
+        // Connection 1's snapshot is unchanged (point-in-time isolation).
+        assert_eq!(
+            snap1.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("old-secret")
+        );
+    }
+
+    #[test]
+    fn arcswap_resolver_starts_empty_then_populated() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let shared: Arc<ArcSwapOption<SecretResolver>> = Arc::new(ArcSwapOption::empty());
+
+        assert!(shared.load_full().is_none());
+
+        let env = HashMap::from([("TOKEN".into(), "tok-123".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        shared.store(resolver.map(Arc::new));
+
+        let snap: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap.as_ref().unwrap().resolve_by_env_key("TOKEN"),
+            Some("tok-123")
+        );
+    }
+
+    #[test]
+    fn arcswap_resolver_can_be_cleared() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let env = HashMap::from([("KEY".into(), "val".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        let shared = Arc::new(ArcSwapOption::from(resolver.map(Arc::new)));
+
+        assert!(shared.load_full().is_some());
+
+        shared.store(None);
+        assert!(shared.load_full().is_none());
+    }
 }

@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use arc_swap::ArcSwapOption;
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
@@ -155,7 +156,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
-        secret_resolver: Option<Arc<SecretResolver>>,
+        secret_resolver: Arc<ArcSwapOption<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -194,7 +195,8 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver = secret_resolver.clone();
+                        let resolver: Option<Arc<SecretResolver>> =
+                            secret_resolver.load_full();
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(

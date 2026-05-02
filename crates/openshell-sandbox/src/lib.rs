@@ -23,6 +23,7 @@ mod secrets;
 mod ssh;
 mod supervisor_session;
 
+use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -34,6 +35,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::future::Future;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -304,7 +306,7 @@ pub async fn run_sandbox(
     };
 
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
-    let secret_resolver = secret_resolver.map(Arc::new);
+    let secret_resolver = Arc::new(ArcSwapOption::from(secret_resolver.map(Arc::new)));
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -822,6 +824,37 @@ pub async fn run_sandbox(
                 );
             }
         });
+
+        // Spawn background provider poll task to refresh credentials at runtime.
+        {
+            let poll_id = id.clone();
+            let poll_endpoint = endpoint.clone();
+            let poll_resolver = secret_resolver.clone();
+            let poll_interval_secs: u64 = std::env::var("OPENSHELL_PROVIDER_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+
+            tokio::spawn(async move {
+                if let Err(e) = run_provider_poll_loop(
+                    &poll_endpoint,
+                    &poll_id,
+                    &poll_resolver,
+                    poll_interval_secs,
+                )
+                .await
+                {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .message(format!("Provider poll loop exited with error: {e}"))
+                            .build()
+                    );
+                }
+            });
+        }
 
         // Spawn denial aggregator (gRPC mode only, when proxy is active).
         if let Some(rx) = denial_rx {
@@ -2303,6 +2336,69 @@ async fn run_policy_poll_loop(
         current_config_revision = result.config_revision;
         current_policy_hash = result.policy_hash;
         current_settings = result.settings;
+    }
+}
+
+/// Poll the gateway for provider credential updates and hot-swap the
+/// `SecretResolver` when credentials change.
+async fn run_provider_poll_loop(
+    endpoint: &str,
+    sandbox_id: &str,
+    secret_resolver: &Arc<ArcSwapOption<SecretResolver>>,
+    interval_secs: u64,
+) -> Result<()> {
+    use crate::grpc_client::CachedOpenShellClient;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let client = CachedOpenShellClient::connect(endpoint).await?;
+
+    fn hash_env(env: &std::collections::HashMap<String, String>) -> u64 {
+        let mut keys: Vec<&String> = env.keys().collect();
+        keys.sort();
+        let mut h = DefaultHasher::new();
+        for k in keys {
+            k.hash(&mut h);
+            env[k].hash(&mut h);
+        }
+        h.finish()
+    }
+
+    let mut current_hash: u64 = match client.fetch_provider_environment(sandbox_id).await {
+        Ok(env) => hash_env(&env),
+        Err(_) => 0,
+    };
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let new_env = match client.fetch_provider_environment(sandbox_id).await {
+            Ok(env) => env,
+            Err(e) => {
+                debug!(error = %e, "Provider poll: server unreachable, will retry");
+                continue;
+            }
+        };
+
+        let new_hash = hash_env(&new_env);
+        if new_hash == current_hash {
+            continue;
+        }
+
+        let (_child_env, new_resolver) = SecretResolver::from_provider_env(new_env);
+        secret_resolver.store(new_resolver.map(Arc::new));
+
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "loaded")
+                .message("Provider credentials refreshed via live poll")
+                .build()
+        );
+
+        current_hash = new_hash;
     }
 }
 
