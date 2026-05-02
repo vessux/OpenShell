@@ -64,6 +64,10 @@ pub struct L7EndpointConfig {
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
     pub allow_encoded_slash: bool,
+    /// When true, the proxy returns the post-rewrite request headers as a JSON
+    /// response instead of forwarding upstream. Used for wire proof testing.
+    /// Defaults to false.
+    pub echo: bool,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -139,12 +143,14 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
+    let echo = get_object_bool(val, "echo").unwrap_or(false);
 
     Some(L7EndpointConfig {
         protocol,
         tls,
         enforcement,
         allow_encoded_slash,
+        echo,
     })
 }
 
@@ -1741,5 +1747,35 @@ mod tests {
         let config = parse_cred_inject_config(&val).unwrap();
         assert_eq!(config.inject.len(), 1);
         assert_eq!(config.inject[0].header, "Authorization");
+    }
+
+    #[test]
+    fn parse_l7_config_echo_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "api.example.com", "port": 443, "enforcement": "enforce"}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.echo);
+    }
+
+    #[test]
+    fn parse_l7_config_echo_true() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "api.example.com", "port": 443, "enforcement": "enforce", "echo": true}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.echo);
+    }
+
+    #[test]
+    fn parse_l7_config_echo_false_explicit() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "api.example.com", "port": 443, "echo": false}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.echo);
     }
 }

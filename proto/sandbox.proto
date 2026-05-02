@@ -109,6 +109,9 @@ message NetworkEndpoint {
   // the specified headers from incoming requests and injects
   // provider-managed credentials before forwarding.
   CredInjectConfig cred_inject = 12;
+  // When true, the proxy returns post-rewrite headers as JSON instead of
+  // forwarding upstream. For wire proof testing.
+  bool echo = 13;
 }
 
 // Credential injection configuration for a network endpoint.

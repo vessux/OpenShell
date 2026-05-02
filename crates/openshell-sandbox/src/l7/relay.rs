@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{BodyLength, L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::secrets::{self, SecretResolver};
@@ -16,9 +16,9 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
 pub struct L7EvalContext {
@@ -38,6 +38,8 @@ pub struct L7EvalContext {
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
     /// Per-endpoint credential strip/inject configuration.
     pub(crate) cred_inject: Option<super::CredInjectConfig>,
+    /// When true, return post-rewrite headers as JSON instead of forwarding upstream.
+    pub(crate) echo: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -311,28 +313,57 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
-                &req,
-                client,
-                upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
-                ctx.cred_inject.as_ref(),
-            )
-            .await?;
-            match outcome {
-                RelayOutcome::Reusable => {} // continue loop
-                RelayOutcome::Consumed => {
-                    debug!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        "Upstream connection not reusable, closing L7 relay"
-                    );
-                    return Ok(());
+            if ctx.echo {
+                // Echo mode: drain request body, then return post-rewrite headers as JSON.
+                let header_end = req.raw_header.windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(req.raw_header.len(), |p| p + 4);
+                let overflow_len = req.raw_header[header_end..].len() as u64;
+                if let BodyLength::ContentLength(len) = req.body_length {
+                    let remaining = len.saturating_sub(overflow_len);
+                    if remaining > 0 {
+                        let mut discard = tokio::io::sink();
+                        let mut take = (&mut *client).take(remaining);
+                        tokio::io::copy(&mut take, &mut discard).await.into_diagnostic()?;
+                    }
                 }
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+
+                let outcome = crate::l7::rest::echo_http_request(
+                    &req,
+                    client,
+                    ctx.secret_resolver.as_deref(),
+                    ctx.cred_inject.as_ref(),
+                    &ctx.policy_name,
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {}
+                    _ => return Ok(()),
+                }
+            } else {
+                // Forward request to upstream and relay response
+                let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                    &req,
+                    client,
+                    upstream,
+                    ctx.secret_resolver.as_deref(),
+                    Some(engine.generation_guard()),
+                    ctx.cred_inject.as_ref(),
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {} // continue loop
+                    RelayOutcome::Consumed => {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            "Upstream connection not reusable, closing L7 relay"
+                        );
+                        return Ok(());
+                    }
+                    RelayOutcome::Upgraded { overflow } => {
+                        return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                    }
                 }
             }
         } else {

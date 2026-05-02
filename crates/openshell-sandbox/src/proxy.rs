@@ -26,7 +26,7 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -498,6 +498,113 @@ async fn handle_tcp_connection(
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
+    // Query L7 config early so we can detect echo mode before DNS resolution.
+    let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
+    let is_echo = l7_config.as_ref().is_some_and(|c| c.echo);
+
+    if is_echo {
+        // Echo mode: skip DNS resolution and upstream connect entirely.
+        info!(
+            host = %host_lc,
+            port = port,
+            "ECHO mode active — skipping DNS/upstream, will return headers as JSON"
+        );
+
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+        {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "opa")
+                .message(format!("CONNECT_ECHO allowed {host_lc}:{port}"))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            policy_name: matched_policy.clone().unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            secret_resolver: filter_resolver_by_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+                &secret_resolver,
+            ),
+            cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+            echo: true,
+        };
+
+        // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
+        let (mut dummy_upstream, _dummy_rx) = tokio::io::duplex(1);
+
+        if let Some(ref l7_config) = l7_config {
+            let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                warn!("Failed to clone OPA engine for echo L7: {e}");
+                regorus::Engine::new()
+            });
+
+            // Peek to detect TLS vs plaintext (same logic as normal path).
+            let mut peek_buf = [0u8; 8];
+            let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            if crate::l7::tls::looks_like_tls(&peek_buf[..n]) {
+                if let Some(ref tls) = tls_state {
+                    let mut tls_client =
+                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                    let _ = crate::l7::relay::relay_with_inspection(
+                        l7_config,
+                        std::sync::Mutex::new(tunnel_engine),
+                        &mut tls_client,
+                        &mut dummy_upstream,
+                        &ctx,
+                    )
+                    .await;
+                }
+            } else {
+                let _ = crate::l7::relay::relay_with_inspection(
+                    l7_config,
+                    std::sync::Mutex::new(tunnel_engine),
+                    &mut client,
+                    &mut dummy_upstream,
+                    &ctx,
+                )
+                .await;
+            }
+        }
+
+        return Ok(());
+    }
+
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
@@ -740,6 +847,7 @@ async fn handle_tcp_connection(
             &secret_resolver,
         ),
         cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+        echo: l7_config.as_ref().is_some_and(|c| c.echo),
     };
 
     if effective_tls_skip {
@@ -2710,6 +2818,7 @@ async fn handle_forward_proxy(
                 &secret_resolver,
             ),
             cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+            echo: l7_config.echo,
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA

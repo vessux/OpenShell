@@ -122,6 +122,10 @@ struct NetworkEndpointDef {
     /// the specified headers and injects provider-managed credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cred_inject: Option<CredInjectDef>,
+    /// When true, the proxy returns post-rewrite headers as JSON instead of
+    /// forwarding upstream. For wire proof testing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    echo: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -307,6 +311,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     })
                                     .collect(),
                             }),
+                            echo: e.echo,
                         }
                     })
                     .collect(),
@@ -460,6 +465,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     })
                                     .collect(),
                             }),
+                            echo: e.echo,
                         }
                     })
                     .collect(),

@@ -1084,6 +1084,26 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.allow_encoded_slash {
                         ep["allow_encoded_slash"] = true.into();
                     }
+                    if let Some(ref ci) = e.cred_inject {
+                        let inject: Vec<serde_json::Value> = ci
+                            .inject
+                            .iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "header": h.header,
+                                    "from_credential": h.from_credential,
+                                })
+                            })
+                            .collect();
+                        ep["cred_inject"] = serde_json::json!({
+                            "provider": ci.provider,
+                            "strip_headers": ci.strip_headers,
+                            "inject": inject,
+                        });
+                    }
+                    if e.echo {
+                        ep["echo"] = true.into();
+                    }
                     ep
                 })
                 .collect();
