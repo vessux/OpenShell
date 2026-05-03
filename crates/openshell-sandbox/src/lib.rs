@@ -22,6 +22,7 @@ mod sandbox;
 mod secrets;
 mod ssh;
 mod supervisor_session;
+pub(crate) mod trust;
 
 use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
@@ -308,6 +309,10 @@ pub async fn run_sandbox(
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = Arc::new(ArcSwapOption::from(secret_resolver.map(Arc::new)));
 
+    let trust_cache = Arc::new(crate::trust::TrustCache::new(
+        std::time::Duration::from_secs(3600),
+    ));
+
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
         .as_ref()
@@ -484,6 +489,7 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            trust_cache.clone(),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)

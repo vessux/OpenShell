@@ -3,13 +3,13 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
-use arc_swap::ArcSwapOption;
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
+use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
@@ -158,6 +158,7 @@ impl ProxyHandle {
         inference_ctx: Option<Arc<InferenceContext>>,
         secret_resolver: Arc<ArcSwapOption<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        trust_cache: Arc<crate::trust::TrustCache>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -195,12 +196,12 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver: Option<Arc<SecretResolver>> =
-                            secret_resolver.load_full();
+                        let resolver: Option<Arc<SecretResolver>> = secret_resolver.load_full();
                         let dtx = denial_tx.clone();
+                        let tc = trust_cache.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, tc,
                             )
                             .await
                             {
@@ -317,6 +318,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -361,6 +363,7 @@ async fn handle_tcp_connection(
             entrypoint_pid,
             secret_resolver,
             denial_tx.as_ref(),
+            trust_cache,
         )
         .await;
     }
@@ -559,6 +562,8 @@ async fn handle_tcp_connection(
             ),
             cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
             echo: true,
+            trust_cache: Some(trust_cache.clone()),
+            trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
         };
 
         // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
@@ -848,6 +853,8 @@ async fn handle_tcp_connection(
         ),
         cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
         echo: l7_config.as_ref().is_some_and(|c| c.echo),
+        trust_cache: Some(trust_cache.clone()),
+        trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
     };
 
     if effective_tls_skip {
@@ -1857,6 +1864,50 @@ fn query_cred_inject_config(
     }
 }
 
+/// Query trust_check config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(TrustCheckConfig)` if the matched endpoint has trust_check config,
+/// `None` otherwise.
+fn query_trust_check_config(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::TrustCheckConfig> {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_trust_check_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query trust_check endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
 /// Query OPA for `allowed_secrets` and return a filtered `SecretResolver`.
 ///
 /// If the matched policy has no `allowed_secrets` constraint (or the list is
@@ -2582,6 +2633,7 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -2819,6 +2871,8 @@ async fn handle_forward_proxy(
             ),
             cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
             echo: l7_config.echo,
+            trust_cache: Some(trust_cache.clone()),
+            trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA
@@ -2874,7 +2928,7 @@ async fn handle_forward_proxy(
         };
 
         let (allowed, reason) =
-            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info, None)
                 .unwrap_or_else(|e| {
                     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Fail)

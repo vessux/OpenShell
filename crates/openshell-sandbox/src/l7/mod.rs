@@ -100,6 +100,12 @@ pub(crate) struct CredInjectConfig {
     pub(crate) inject: Vec<crate::secrets::CredInjectDirective>,
 }
 
+/// Trust check configuration for a package registry endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct TrustCheckConfig {
+    pub(crate) registry: String,
+}
+
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
 ///
 /// The value is expected to be the raw endpoint object from the Rego data,
@@ -188,6 +194,15 @@ pub(crate) fn parse_cred_inject_config(val: &regorus::Value) -> Option<CredInjec
         strip_headers,
         inject,
     })
+}
+
+pub(crate) fn parse_trust_check_config(val: &regorus::Value) -> Option<TrustCheckConfig> {
+    let tc = get_object_val(val, "trust_check")?;
+    let registry = get_object_str(tc, "registry")?;
+    if registry.is_empty() {
+        return None;
+    }
+    Some(TrustCheckConfig { registry })
 }
 
 /// Extract a raw `&regorus::Value` from an object by key.
@@ -1777,5 +1792,23 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(!config.echo);
+    }
+
+    #[test]
+    fn parse_trust_check_config_present() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "pypi.org", "port": 443, "enforcement": "enforce", "trust_check": {"registry": "pypi"}}"#,
+        ).unwrap();
+        let tc = parse_trust_check_config(&val).expect("should parse trust_check");
+        assert_eq!(tc.registry, "pypi");
+    }
+
+    #[test]
+    fn parse_trust_check_config_absent() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "pypi.org", "port": 443}"#,
+        )
+        .unwrap();
+        assert!(parse_trust_check_config(&val).is_none());
     }
 }

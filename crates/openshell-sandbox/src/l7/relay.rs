@@ -40,6 +40,10 @@ pub struct L7EvalContext {
     pub(crate) cred_inject: Option<super::CredInjectConfig>,
     /// When true, return post-rewrite headers as JSON instead of forwarding upstream.
     pub(crate) echo: bool,
+    /// Trust cache for deps.dev lookups (shared across connections).
+    pub(crate) trust_cache: Option<Arc<crate::trust::TrustCache>>,
+    /// Per-endpoint trust check config (registry type).
+    pub(crate) trust_check: Option<super::TrustCheckConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,8 +251,28 @@ where
             query_params: req.query_params.clone(),
         };
 
+        // Trust check: extract package info and look up trust data.
+        let trust_result = if let (Some(tc), Some(cache)) = (&ctx.trust_check, &ctx.trust_cache) {
+            if let Some(registry) = crate::trust::Registry::parse(&tc.registry) {
+                if let Some(pkg) = crate::trust::parse_package_ref(
+                    registry,
+                    &request_info.action,
+                    &request_info.target,
+                ) {
+                    Some(cache.get_or_fetch(&pkg).await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) =
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -309,13 +333,75 @@ where
             ocsf_emit!(event);
         }
 
+        // Trust-specific OCSF events
+        if let Some(ref trust) = trust_result {
+            if trust.lookup_failed {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Low)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_LOOKUP_FAILED {} {}@{} — allowing (fail-open)",
+                        request_info.action, trust.package_name, trust.version,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.critical_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_DENIED {} {}@{} — {} critical vulnerabilities",
+                        request_info.action,
+                        trust.package_name,
+                        trust.version,
+                        trust.critical_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.high_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Medium)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_AUDIT {} {}@{} — {} high vulnerabilities",
+                        request_info.action, trust.package_name, trust.version, trust.high_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            }
+        }
+
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             if ctx.echo {
                 // Echo mode: drain request body, then return post-rewrite headers as JSON.
-                let header_end = req.raw_header.windows(4)
+                let header_end = req
+                    .raw_header
+                    .windows(4)
                     .position(|w| w == b"\r\n\r\n")
                     .map_or(req.raw_header.len(), |p| p + 4);
                 let overflow_len = req.raw_header[header_end..].len() as u64;
@@ -324,7 +410,9 @@ where
                     if remaining > 0 {
                         let mut discard = tokio::io::sink();
                         let mut take = (&mut *client).take(remaining);
-                        tokio::io::copy(&mut take, &mut discard).await.into_diagnostic()?;
+                        tokio::io::copy(&mut take, &mut discard)
+                            .await
+                            .into_diagnostic()?;
                     }
                 }
 
@@ -362,7 +450,8 @@ where
                         return Ok(());
                     }
                     RelayOutcome::Upgraded { overflow } => {
-                        return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                        return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port)
+                            .await;
                     }
                 }
             }
@@ -433,6 +522,7 @@ pub fn evaluate_l7_request(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
+    trust: Option<&crate::trust::TrustResult>,
 ) -> Result<(bool, String)> {
     if engine.is_stale() {
         return Err(miette!(
@@ -442,7 +532,7 @@ pub fn evaluate_l7_request(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let mut input_json = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -458,6 +548,21 @@ pub fn evaluate_l7_request(
             "query_params": request.query_params.clone(),
         }
     });
+
+    if let Some(trust) = trust {
+        input_json["trust"] = serde_json::json!({
+            "package": trust.package_name,
+            "version": trust.version,
+            "registry": trust.registry,
+            "critical_vulns": trust.critical_vulns,
+            "high_vulns": trust.high_vulns,
+            "medium_vulns": trust.medium_vulns,
+            "low_vulns": trust.low_vulns,
+            "license": trust.license,
+            "is_stale": trust.is_stale,
+            "lookup_failed": trust.lookup_failed,
+        });
+    }
 
     let mut engine = engine
         .engine()

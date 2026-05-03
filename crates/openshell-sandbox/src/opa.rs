@@ -1104,6 +1104,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.echo {
                         ep["echo"] = true.into();
                     }
+                    if let Some(ref tc) = e.trust_check {
+                        ep["trust_check"] = serde_json::json!({
+                            "registry": tc.registry,
+                        });
+                    }
                     ep
                 })
                 .collect();

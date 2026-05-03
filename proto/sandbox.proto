@@ -112,6 +112,9 @@ message NetworkEndpoint {
   // When true, the proxy returns post-rewrite headers as JSON instead of
   // forwarding upstream. For wire proof testing.
   bool echo = 13;
+  // Optional trust check config. When set, package downloads are evaluated
+  // against deps.dev vulnerability and license data.
+  TrustCheckConfig trust_check = 14;
 }
 
 // Credential injection configuration for a network endpoint.
@@ -135,6 +138,14 @@ message CredInjectHeader {
   // Name of the credential value to use as the header value
   // (e.g. "ANTHROPIC_API_KEY").
   string from_credential = 2;
+}
+
+// Trust check configuration for package registry endpoints.
+// When set, the proxy queries deps.dev for vulnerability/license data
+// before allowing package downloads.
+message TrustCheckConfig {
+  // Package registry type: "pypi" or "npm".
+  string registry = 1;
 }
 
 // An L7 deny rule that blocks specific requests.

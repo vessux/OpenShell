@@ -1814,22 +1814,18 @@ mod tests {
 
         // gh tries to inject ANTHROPIC_API_KEY via cred_inject → should fail
         let raw = b"GET /repos HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
-        let inject = vec![
-            CredInjectDirective {
-                header: "x-api-key".into(),
-                from_credential: "ANTHROPIC_API_KEY".into(),
-            },
-        ];
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".into(),
+            from_credential: "ANTHROPIC_API_KEY".into(),
+        }];
         let result = apply_cred_inject(raw, &[], &inject, &gh_resolver);
         assert!(result.is_err(), "gh should not resolve ANTHROPIC_API_KEY");
 
         // gh tries to inject GITHUB_TOKEN → should succeed
-        let inject_github = vec![
-            CredInjectDirective {
-                header: "Authorization".into(),
-                from_credential: "GITHUB_TOKEN".into(),
-            },
-        ];
+        let inject_github = vec![CredInjectDirective {
+            header: "Authorization".into(),
+            from_credential: "GITHUB_TOKEN".into(),
+        }];
         let result = apply_cred_inject(raw, &[], &inject_github, &gh_resolver);
         assert!(result.is_ok());
         let bytes = result.unwrap();

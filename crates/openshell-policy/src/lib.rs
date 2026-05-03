@@ -19,7 +19,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     CredInjectConfig, CredInjectHeader, FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher,
     L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    SandboxPolicy, TrustCheckConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,10 @@ struct NetworkEndpointDef {
     /// forwarding upstream. For wire proof testing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     echo: bool,
+    /// Optional trust check config. When set, the proxy queries deps.dev for
+    /// vulnerability/license data before allowing package downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_check: Option<TrustCheckDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,7 +150,13 @@ struct CredInjectHeaderDef {
     from_credential: String,
 }
 
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustCheckDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registry: String,
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
@@ -312,6 +322,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     .collect(),
                             }),
                             echo: e.echo,
+                            trust_check: e.trust_check.map(|tc| TrustCheckConfig {
+                                registry: tc.registry,
+                            }),
                         }
                     })
                     .collect(),
@@ -466,6 +479,9 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     .collect(),
                             }),
                             echo: e.echo,
+                            trust_check: e.trust_check.as_ref().map(|tc| TrustCheckDef {
+                                registry: tc.registry.clone(),
+                            }),
                         }
                     })
                     .collect(),
@@ -1656,5 +1672,33 @@ network_policies:
         assert_eq!(ci2.inject.len(), 1);
         assert_eq!(ci2.inject[0].header, "x-api-key");
         assert_eq!(ci2.inject[0].from_credential, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn trust_check_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  pip:
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        trust_check:
+          registry: pypi
+"#;
+        let policy = parse_sandbox_policy(yaml).unwrap();
+        let ep = &policy.network_policies["pip"].endpoints[0];
+        let tc = ep.trust_check.as_ref().expect("trust_check should be set");
+        assert_eq!(tc.registry, "pypi");
+
+        let yaml_back = serialize_sandbox_policy(&policy).unwrap();
+        let policy2 = parse_sandbox_policy(&yaml_back).unwrap();
+        let tc2 = policy2.network_policies["pip"].endpoints[0]
+            .trust_check
+            .as_ref()
+            .expect("trust_check should survive round-trip");
+        assert_eq!(tc2.registry, "pypi");
     }
 }

@@ -994,9 +994,8 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("echo: credential rewrite failed: {e}"))?;
 
-    let cred_inject_applied = cred_inject.is_some_and(|ci| {
-        !ci.strip_headers.is_empty() || !ci.inject.is_empty()
-    });
+    let cred_inject_applied =
+        cred_inject.is_some_and(|ci| !ci.strip_headers.is_empty() || !ci.inject.is_empty());
 
     let empty_resolver = crate::secrets::SecretResolver::default();
     let final_header = if let Some(ci) = cred_inject {
@@ -2750,9 +2749,12 @@ mod tests {
     #[tokio::test]
     async fn echo_http_request_returns_json_with_rewritten_headers() {
         let (child_env, resolver) = SecretResolver::from_provider_env(
-            [("ANTHROPIC_API_KEY".to_string(), "sk-ant-real-key".to_string())]
-                .into_iter()
-                .collect(),
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-real-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         );
         let resolver = resolver.unwrap();
 
@@ -2793,7 +2795,9 @@ mod tests {
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);
 
         let body_start = response.find("\r\n\r\n").unwrap() + 4;
@@ -2826,21 +2830,17 @@ mod tests {
 
         let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
 
-        let outcome = echo_http_request(
-            &req,
-            &mut client_write,
-            None,
-            None,
-            "my_policy",
-        )
-        .await
-        .unwrap();
+        let outcome = echo_http_request(&req, &mut client_write, None, None, "my_policy")
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, RelayOutcome::Reusable));
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);
 
         let body_start = response.find("\r\n\r\n").unwrap() + 4;

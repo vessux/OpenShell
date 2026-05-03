@@ -65,6 +65,12 @@ base64 = { workspace = true }
 # IP network / CIDR parsing
 ipnet = "2"
 
+# HTTP client
+reqwest = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
 # Serialization
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
