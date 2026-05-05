@@ -53,7 +53,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libssl-dev clang protobuf-compiler
+          sudo apt-get install -y -qq pkg-config libssl-dev clang protobuf-compiler libz3-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,8 +69,10 @@ jobs:
       - name: Build openshell-sandbox (supervisor)
         run: cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
 
+      # Use system libz3-dev. Same reason as macOS: bundled-z3's vendored
+      # source hits modern-clang overload-resolution errors.
       - name: Build openshell CLI
-        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
+        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli
 
       - name: Package binaries
         run: |
@@ -100,8 +102,8 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Install protobuf
-        run: brew install protobuf
+      - name: Install build deps
+        run: brew install protobuf z3
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -116,8 +118,13 @@ jobs:
       - name: Build openshell-gateway
         run: cargo build --release --target "$TARGET" -p openshell-server
 
+      # Use system z3 from Homebrew. Bundled-z3 vendors an older z3 source
+      # whose obj_hashtable.h hits clang overload-resolution errors on
+      # macos-14's Apple clang.
       - name: Build openshell CLI
-        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
+        env:
+          Z3_SYS_Z3_HEADER: /opt/homebrew/include/z3.h
+        run: cargo build --release --target "$TARGET" -p openshell-cli
 
       - name: Package binaries
         run: |
