@@ -340,7 +340,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None, cred_inject).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
@@ -349,7 +349,7 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
-    cred_inject: Option<&crate::CredInjectConfig>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,

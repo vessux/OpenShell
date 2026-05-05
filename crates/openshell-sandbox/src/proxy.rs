@@ -502,8 +502,11 @@ async fn handle_tcp_connection(
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     // Query L7 config early so we can detect echo mode before DNS resolution.
-    let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
-    let is_echo = l7_config.as_ref().is_some_and(|c| c.echo);
+    let echo_l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
+    let is_echo = echo_l7_route
+        .as_ref()
+        .and_then(|route| route.config.as_ref())
+        .is_some_and(|c| c.config.echo);
 
     if is_echo {
         // Echo mode: skip DNS resolution and upstream connect entirely.
@@ -569,11 +572,14 @@ async fn handle_tcp_connection(
         // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
         let (mut dummy_upstream, _dummy_rx) = tokio::io::duplex(1);
 
-        if let Some(ref l7_config) = l7_config {
-            let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                warn!("Failed to clone OPA engine for echo L7: {e}");
-                regorus::Engine::new()
-            });
+        if let Some(l7_config) = echo_l7_route.as_ref().and_then(|route| route.config.as_ref()) {
+            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                    return Ok(());
+                }
+            };
 
             // Peek to detect TLS vs plaintext (same logic as normal path).
             let mut peek_buf = [0u8; 8];
@@ -587,8 +593,8 @@ async fn handle_tcp_connection(
                     let mut tls_client =
                         crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
                     let _ = crate::l7::relay::relay_with_inspection(
-                        l7_config,
-                        std::sync::Mutex::new(tunnel_engine),
+                        &l7_config.config,
+                        tunnel_engine,
                         &mut tls_client,
                         &mut dummy_upstream,
                         &ctx,
@@ -597,8 +603,8 @@ async fn handle_tcp_connection(
                 }
             } else {
                 let _ = crate::l7::relay::relay_with_inspection(
-                    l7_config,
-                    std::sync::Mutex::new(tunnel_engine),
+                    &l7_config.config,
+                    tunnel_engine,
                     &mut client,
                     &mut dummy_upstream,
                     &ctx,
@@ -852,7 +858,7 @@ async fn handle_tcp_connection(
             &secret_resolver,
         ),
         cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
-        echo: l7_config.as_ref().is_some_and(|c| c.echo),
+        echo: l7_route.as_ref().and_then(|r| r.config.as_ref()).is_some_and(|c| c.config.echo),
         trust_cache: Some(trust_cache.clone()),
         trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
     };
@@ -2609,6 +2615,7 @@ where
         upstream,
         None,
         Some(generation_guard),
+        None,
     )
     .await
 }
@@ -2870,7 +2877,7 @@ async fn handle_forward_proxy(
                 &secret_resolver,
             ),
             cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
-            echo: l7_config.echo,
+            echo: l7_config.config.echo,
             trust_cache: Some(trust_cache.clone()),
             trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
         };
