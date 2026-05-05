@@ -1,0 +1,169 @@
+name: openlock release
+
+# Fork-specific release workflow. Builds the openshell binaries that
+# openlock needs (openshell-gateway, openshell-sandbox, openshell CLI)
+# on public GitHub-hosted runners, attaches them to a GitHub Release.
+#
+# Distinct from upstream's release-tag.yml which targets NVIDIA's
+# self-hosted infrastructure (custom runners, NVIDIA GHCR, debian
+# packaging, fern docs, GitLab triggers).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libssl-dev clang protobuf-compiler
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: openlock-release-${{ matrix.target }}
+
+      - name: Build openshell-gateway
+        run: cargo build --release --target ${{ matrix.target }} -p openshell-server
+
+      - name: Build openshell-sandbox (supervisor)
+        run: cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
+
+      - name: Build openshell CLI
+        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cd target/${{ matrix.target }}/release
+          tar -czf "${GITHUB_WORKSPACE}/artifacts/openshell-gateway-${{ matrix.target }}.tar.gz" openshell-gateway
+          tar -czf "${GITHUB_WORKSPACE}/artifacts/openshell-sandbox-${{ matrix.target }}.tar.gz" openshell-sandbox
+          tar -czf "${GITHUB_WORKSPACE}/artifacts/openshell-${{ matrix.target }}.tar.gz" openshell
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  build-macos:
+    name: Build macOS aarch64
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: openlock-release-aarch64-apple-darwin
+
+      - name: Build openshell-gateway
+        run: cargo build --release --target "$TARGET" -p openshell-server
+
+      - name: Build openshell CLI
+        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cd target/"$TARGET"/release
+          tar -czf "${GITHUB_WORKSPACE}/artifacts/openshell-gateway-${TARGET}.tar.gz" openshell-gateway
+          tar -czf "${GITHUB_WORKSPACE}/artifacts/openshell-${TARGET}.tar.gz" openshell
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  release:
+    name: Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release/
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: release
+        run: |
+          set -euo pipefail
+          ls -lh
+          sha256sum *.tar.gz > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/checksums-sha256.txt
