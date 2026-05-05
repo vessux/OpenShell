@@ -16,9 +16,9 @@
 //! CLI's ephemeral localhost server captures and stores the token.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::get,
 };
@@ -58,7 +58,25 @@ struct ConnectParams {
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/auth/connect", get(auth_connect))
+        .route("/auth/oidc-config", get(oidc_config_handler))
         .with_state(state)
+}
+
+/// OIDC configuration discovery endpoint.
+///
+/// Returns the OIDC issuer and audience when OIDC is configured on the server,
+/// so CLI clients can auto-discover settings during `gateway add`.
+async fn oidc_config_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    state.config.oidc.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |oidc| {
+            Json(serde_json::json!({
+                "issuer": oidc.issuer,
+                "audience": oidc.audience,
+            }))
+            .into_response()
+        },
+    )
 }
 
 /// Handle the auth connect request.
@@ -96,32 +114,29 @@ async fn auth_connect(
 
     let safe_gateway = html_escape(&gateway_display);
 
-    match cf_token {
-        Some(token) => {
-            let nonce = uuid::Uuid::new_v4().to_string();
-            let csp = format!(
-                "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
-            );
-            (
-                [(header::CONTENT_SECURITY_POLICY, csp)],
-                Html(render_connect_page(
-                    &safe_gateway,
-                    params.callback_port,
-                    &token,
-                    &params.code,
-                    &nonce,
-                )),
-            )
-                .into_response()
-        }
-        None => {
-            let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
-            (
-                [(header::CONTENT_SECURITY_POLICY, csp)],
-                Html(render_waiting_page(params.callback_port, &params.code)),
-            )
-                .into_response()
-        }
+    if let Some(token) = cf_token {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let csp = format!(
+            "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
+        );
+        (
+            [(header::CONTENT_SECURITY_POLICY, csp)],
+            Html(render_connect_page(
+                &safe_gateway,
+                params.callback_port,
+                &token,
+                &params.code,
+                &nonce,
+            )),
+        )
+            .into_response()
+    } else {
+        let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
+        (
+            [(header::CONTENT_SECURITY_POLICY, csp)],
+            Html(render_waiting_page(params.callback_port, &params.code)),
+        )
+            .into_response()
     }
 }
 

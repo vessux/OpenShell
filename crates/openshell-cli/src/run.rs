@@ -344,7 +344,7 @@ impl ProvisioningDisplay {
     }
 
     /// Clear all progress output (spinner, spacer, and completed step lines).
-    fn clear(&mut self) {
+    fn clear(&self) {
         self.spacer.finish_and_clear();
         self.spinner.finish_and_clear();
         for bar in &self.completed_bars {
@@ -388,13 +388,16 @@ fn format_bytes(bytes: u64) -> String {
     const GB: u64 = 1024 * MB;
 
     if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
+        // GB-scale precision loss is acceptable for a human-readable label.
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
     } else if bytes >= MB {
         format!("{} MB", bytes / MB)
     } else if bytes >= KB {
         format!("{} KB", bytes / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -426,9 +429,7 @@ const CLUSTER_DEPLOY_LOG_LINES: usize = 15;
 
 /// Return the current terminal width, falling back to 80 columns.
 fn term_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+    crossterm::terminal::size().map_or(80, |(w, _)| w as usize)
 }
 
 /// Build a horizontal rule of `─` characters with an optional centered label.
@@ -443,7 +444,7 @@ fn horizontal_rule(label: Option<&str>, width: usize) -> String {
             let remaining = width - text_len;
             let left = remaining / 2;
             let right = remaining - left;
-            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right),)
+            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right))
         }
         None => "─".repeat(width),
     }
@@ -623,11 +624,10 @@ impl GatewayDeployLogPanel {
     }
 
     fn update_spinner_message(&self) {
-        let msg = if let Some(detail) = &self.progress {
-            format!("{} ({})", self.status, detail.dimmed())
-        } else {
-            self.status.clone()
-        };
+        let msg = self.progress.as_ref().map_or_else(
+            || self.status.clone(),
+            |detail| format!("{} ({})", self.status, detail.dimmed()),
+        );
         self.spinner.set_message(msg);
     }
 
@@ -881,13 +881,11 @@ fn plaintext_gateway_metadata(
     remote: Option<&str>,
     local: bool,
 ) -> GatewayMetadata {
-    let (remote_host, resolved_host) = if let Some(dest) = remote {
+    let (remote_host, resolved_host) = remote.map_or((None, None), |dest| {
         let ssh_host = extract_host_from_ssh_destination(dest);
         let resolved = resolve_ssh_hostname(&ssh_host);
         (Some(dest.to_string()), Some(resolved))
-    } else {
-        (None, None)
-    };
+    });
 
     GatewayMetadata {
         name: name.to_string(),
@@ -897,8 +895,7 @@ fn plaintext_gateway_metadata(
         remote_host,
         resolved_host,
         auth_mode: Some("plaintext".to_string()),
-        edge_team_domain: None,
-        edge_auth_url: None,
+        ..Default::default()
     }
 }
 
@@ -958,12 +955,17 @@ where
 ///
 /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand for
 /// `--remote user@host` with the gateway endpoint derived from the URL.
+#[allow(clippy::too_many_arguments)]
 pub async fn gateway_add(
     endpoint: &str,
     name: Option<&str>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     local: bool,
+    oidc_issuer: Option<&str>,
+    oidc_client_id: &str,
+    oidc_audience: Option<&str>,
+    oidc_scopes: Option<&str>,
 ) -> Result<()> {
     // If the endpoint starts with ssh://, parse it into an SSH destination
     // and a gateway endpoint automatically.  The host is resolved via
@@ -1045,6 +1047,92 @@ pub async fn gateway_add(
         ));
     }
 
+    // OIDC takes precedence over plaintext/mTLS/edge detection — the user
+    // explicitly opted in with --oidc-issuer regardless of scheme.
+    if let Some(issuer) = oidc_issuer {
+        // When --local is combined with --oidc-issuer, extract mTLS certs
+        // from the running container so the CLI can establish a TLS
+        // connection while using OIDC for application-level auth.
+        if local {
+            let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
+            eprintln!("• Extracting TLS certificates from gateway container...");
+            openshell_bootstrap::extract_and_store_pki(name, None, endpoint_port).await?;
+        }
+
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.clone(),
+            is_remote: !local,
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some(issuer.to_string()),
+            oidc_client_id: Some(oidc_client_id.to_string()),
+            oidc_audience: oidc_audience.map(String::from),
+            oidc_scopes: oidc_scopes.map(String::from),
+            ..Default::default()
+        };
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!("  {} oidc", "Auth:".dimmed());
+        if local {
+            eprintln!("{} TLS certificates extracted", "✓".green().bold());
+        }
+        eprintln!();
+
+        // Check for client_credentials env var (CI mode).
+        if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
+            match crate::oidc_auth::oidc_client_credentials_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!(
+                        "{} Authenticated via client credentials",
+                        "✓".green().bold()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication failed: {e}", "!".yellow());
+                }
+            }
+        } else {
+            match crate::oidc_auth::oidc_browser_auth_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!("{} Authenticated successfully", "✓".green().bold());
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication skipped: {e}", "!".yellow());
+                    eprintln!(
+                        "  Authenticate later with: {}",
+                        "openshell gateway login".dimmed(),
+                    );
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     if endpoint.starts_with("http://") {
         let metadata = plaintext_gateway_metadata(name, &endpoint, remote, local);
         let gateway_type = gateway_type_label(&metadata);
@@ -1084,13 +1172,11 @@ pub async fn gateway_add(
         openshell_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
             .await?;
 
-        let (remote_host, resolved_host) = if let Some(dest) = remote {
+        let (remote_host, resolved_host) = remote.map_or((None, None), |dest| {
             let ssh_host = extract_host_from_ssh_destination(dest);
             let resolved = resolve_ssh_hostname(&ssh_host);
             (Some(dest.to_string()), Some(resolved))
-        } else {
-            (None, None)
-        };
+        });
 
         let metadata = GatewayMetadata {
             name: name.to_string(),
@@ -1100,8 +1186,7 @@ pub async fn gateway_add(
             remote_host,
             resolved_host,
             auth_mode: Some("mtls".to_string()),
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
 
         store_gateway_metadata(name, &metadata)?;
@@ -1125,12 +1210,8 @@ pub async fn gateway_add(
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
             is_remote: true,
-            gateway_port: 0,
-            remote_host: None,
-            resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
 
         store_gateway_metadata(name, &metadata)?;
@@ -1163,9 +1244,9 @@ pub async fn gateway_add(
     Ok(())
 }
 
-/// Re-authenticate with an edge-authenticated gateway.
+/// Re-authenticate with an edge-authenticated or OIDC gateway.
 ///
-/// Opens a browser for edge proxy login and stores the updated token.
+/// Dispatches to the appropriate auth flow based on `auth_mode`.
 pub async fn gateway_login(name: &str) -> Result<()> {
     let metadata = openshell_bootstrap::load_gateway_metadata(name).map_err(|_| {
         miette::miette!(
@@ -1174,18 +1255,91 @@ pub async fn gateway_login(name: &str) -> Result<()> {
         )
     })?;
 
-    if metadata.auth_mode.as_deref() != Some("cloudflare_jwt") {
-        return Err(miette::miette!(
-            "Gateway '{name}' does not use edge authentication.\n\
-             Only edge-authenticated gateways support browser login."
-        ));
+    match metadata.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => {
+            let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
+            openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
+            eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
+        }
+        Some("oidc") => {
+            let issuer = metadata.oidc_issuer.as_deref().ok_or_else(|| {
+                miette::miette!("Gateway '{name}' has OIDC auth but no issuer URL in metadata")
+            })?;
+            let client_id = metadata
+                .oidc_client_id
+                .as_deref()
+                .unwrap_or("openshell-cli");
+            let audience = metadata.oidc_audience.as_deref();
+            let scopes = metadata.oidc_scopes.as_deref();
+
+            let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
+                crate::oidc_auth::oidc_client_credentials_flow(issuer, client_id, audience, scopes)
+                    .await?
+            } else {
+                crate::oidc_auth::oidc_browser_auth_flow(issuer, client_id, audience, scopes)
+                    .await?
+            };
+
+            let username = jwt_preferred_username(&bundle.access_token);
+            openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+
+            if let Some(user) = username {
+                eprintln!(
+                    "{} Authenticated to gateway '{name}' as {user}",
+                    "✓".green().bold(),
+                );
+            } else {
+                eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
+            }
+        }
+        _ => {
+            return Err(miette::miette!(
+                "Gateway '{name}' does not use edge or OIDC authentication.\n\
+                 Only edge-authenticated and OIDC gateways support browser login."
+            ));
+        }
     }
 
-    let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
-    openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
+    Ok(())
+}
 
-    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold(),);
+/// Extract `preferred_username` from a JWT payload without signature verification.
+fn jwt_preferred_username(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("preferred_username")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
 
+/// Clear stored authentication credentials for a gateway.
+pub fn gateway_logout(name: &str) -> Result<()> {
+    let metadata = openshell_bootstrap::load_gateway_metadata(name).map_err(|_| {
+        miette::miette!(
+            "Unknown gateway '{name}'.\n\
+             List available gateways: openshell gateway select"
+        )
+    })?;
+
+    match metadata.auth_mode.as_deref() {
+        Some("oidc") => {
+            openshell_bootstrap::oidc_token::remove_oidc_token(name)?;
+        }
+        Some("cloudflare_jwt") => {
+            openshell_bootstrap::edge_token::remove_edge_token(name)?;
+        }
+        _ => {
+            return Err(miette::miette!(
+                "Gateway '{name}' uses {} authentication — no stored credentials to clear.",
+                metadata.auth_mode.as_deref().unwrap_or("mtls")
+            ));
+        }
+    }
+
+    eprintln!("{} Logged out of gateway '{name}'", "✓".green().bold());
     Ok(())
 }
 
@@ -1424,6 +1578,7 @@ fn print_failure_diagnosis(diagnosis: &openshell_bootstrap::errors::GatewayFailu
 }
 
 /// Provision or start a gateway (local or remote).
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn gateway_admin_deploy(
     name: &str,
     remote: Option<&str>,
@@ -1436,6 +1591,14 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
+    oidc_issuer: Option<&str>,
+    oidc_audience: &str,
+    oidc_client_id: &str,
+    oidc_roles_claim: Option<&str>,
+    oidc_admin_role: Option<&str>,
+    oidc_user_role: Option<&str>,
+    oidc_scopes: Option<&str>,
+    oidc_scopes_claim: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1450,18 +1613,16 @@ pub async fn gateway_admin_deploy(
     });
 
     // If the gateway is already running and we're not recreating, short-circuit.
-    if !recreate {
-        if let Some(existing) =
+    if !recreate
+        && let Some(existing) =
             openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-        {
-            if existing.container_running {
-                eprintln!(
-                    "{} Gateway '{name}' is already running.",
-                    "✓".green().bold()
-                );
-                return Ok(());
-            }
-        }
+        && existing.container_running
+    {
+        eprintln!(
+            "{} Gateway '{name}' is already running.",
+            "✓".green().bold()
+        );
+        return Ok(());
     }
 
     // When resuming an existing gateway (not recreating), prefer the port
@@ -1469,10 +1630,10 @@ pub async fn gateway_admin_deploy(
     // may have originally bootstrapped on a non-default port (e.g. `--port
     // 8082`) or with `--gateway-host host.docker.internal`, and a bare
     // `gateway start` without those flags should honour the original values.
-    let stored_metadata = if !recreate {
-        openshell_bootstrap::load_gateway_metadata(name).ok()
-    } else {
+    let stored_metadata = if recreate {
         None
+    } else {
+        openshell_bootstrap::load_gateway_metadata(name).ok()
     };
     let effective_port = stored_metadata
         .as_ref()
@@ -1502,8 +1663,34 @@ pub async fn gateway_admin_deploy(
     if let Some(token) = registry_token {
         options = options.with_registry_token(token);
     }
+    if let Some(issuer) = oidc_issuer {
+        options = options.with_oidc_issuer(issuer);
+        options = options.with_oidc_audience(oidc_audience);
+        options.oidc_client_id = oidc_client_id.to_string();
+        if let Some(claim) = oidc_roles_claim {
+            options.oidc_roles_claim = Some(claim.to_string());
+        }
+        if let Some(role) = oidc_admin_role {
+            options.oidc_admin_role = Some(role.to_string());
+        }
+        if let Some(role) = oidc_user_role {
+            options.oidc_user_role = Some(role.to_string());
+        }
+        if let Some(claim) = oidc_scopes_claim {
+            options.oidc_scopes_claim = Some(claim.to_string());
+        }
+    }
 
-    let handle = deploy_gateway_with_panel(options, name, location).await?;
+    let handle = Box::pin(deploy_gateway_with_panel(options, name, location)).await?;
+
+    // Persist oidc_scopes in gateway metadata so `gateway login` can
+    // request the correct scopes later.
+    if let Some(scopes) = oidc_scopes
+        && let Ok(mut meta) = openshell_bootstrap::load_gateway_metadata(name)
+    {
+        meta.oidc_scopes = Some(scopes.to_string());
+        let _ = store_gateway_metadata(name, &meta);
+    }
 
     // Wait for the gRPC endpoint to actually accept connections before
     // declaring the gateway ready. The Docker health check may pass before
@@ -1688,6 +1875,7 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
 ///
 /// Connects to the Docker daemon (local or remote via SSH) and retrieves
 /// logs from the `openshell-cluster-{name}` container.
+#[allow(clippy::future_not_send)] // Holds stdout lock; CLI command, never sent across threads.
 pub async fn doctor_logs(
     name: &str,
     lines: Option<usize>,
@@ -1696,24 +1884,29 @@ pub async fn doctor_logs(
     ssh_key: Option<&str>,
 ) -> Result<()> {
     // Build remote options: explicit --remote flag, or auto-resolve from metadata
-    let remote_opts = if let Some(dest) = remote {
-        let mut opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
-        }
-        Some(opts)
-    } else if let Some(metadata) = get_gateway_metadata(name)
-        && metadata.is_remote
-        && let Some(ref host) = metadata.remote_host
-    {
-        let mut opts = RemoteOptions::new(host.clone());
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
-        }
-        Some(opts)
-    } else {
-        None
-    };
+    let remote_opts = remote.map_or_else(
+        || {
+            if let Some(metadata) = get_gateway_metadata(name)
+                && metadata.is_remote
+                && let Some(ref host) = metadata.remote_host
+            {
+                let mut opts = RemoteOptions::new(host.clone());
+                if let Some(key) = ssh_key {
+                    opts = opts.with_ssh_key(key);
+                }
+                Some(opts)
+            } else {
+                None
+            }
+        },
+        |dest| {
+            let mut opts = RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            Some(opts)
+        },
+    );
 
     let stdout = std::io::stdout().lock();
     openshell_bootstrap::gateway_container_logs(remote_opts.as_ref(), name, lines, tail, stdout)
@@ -1744,15 +1937,18 @@ pub fn doctor_exec(
     };
 
     // Resolve remote destination: explicit --remote flag, or auto-resolve from metadata
-    let remote_host = if let Some(dest) = remote {
-        Some(dest.to_string())
-    } else if let Some(metadata) = get_gateway_metadata(name)
-        && metadata.is_remote
-    {
-        metadata.remote_host.clone()
-    } else {
-        None
-    };
+    let remote_host = remote.map_or_else(
+        || {
+            if let Some(metadata) = get_gateway_metadata(name)
+                && metadata.is_remote
+            {
+                metadata.remote_host
+            } else {
+                None
+            }
+        },
+        |dest| Some(dest.to_string()),
+    );
 
     let mut cmd = if let Some(ref host) = remote_host {
         validate_ssh_host(host)?;
@@ -1828,6 +2024,7 @@ pub fn doctor_llm() -> Result<()> {
 ///
 /// Checks Docker connectivity and reports the result. Returns exit code 0
 /// if all checks pass, 1 otherwise.
+#[allow(clippy::future_not_send)] // Holds stdout lock; CLI command, never sent across threads.
 pub async fn doctor_check() -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
@@ -1848,7 +2045,7 @@ pub async fn doctor_check() -> Result<()> {
             match std::env::var("DOCKER_HOST") {
                 Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
                 Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
-            };
+            }
 
             writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
             Ok(())
@@ -1943,11 +2140,15 @@ pub async fn sandbox_create_with_bootstrap(
         ));
     }
     let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
-    let (tls, server, gateway_name) =
-        crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
+    let (tls, server, gateway_name) = Box::pin(crate::bootstrap::run_bootstrap(
+        remote,
+        ssh_key,
+        requested_gpu,
+    ))
+    .await?;
     // Disable bootstrap inside sandbox_create so that a transient connection
     // failure right after deploy does not trigger a second bootstrap attempt.
-    sandbox_create(
+    Box::pin(sandbox_create(
         &server,
         name,
         from,
@@ -1966,9 +2167,9 @@ pub async fn sandbox_create_with_bootstrap(
         tty_override,
         Some(false),
         auto_providers_override,
-        &std::collections::HashMap::new(),
+        &HashMap::new(),
         &tls,
-    )
+    ))
     .await
 }
 
@@ -2003,7 +2204,7 @@ async fn finalize_sandbox_create_session(
 }
 
 /// Create a sandbox with default settings.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)] // user-facing CLI command; default hasher is fine
 pub async fn sandbox_create(
     server: &str,
     name: Option<&str>,
@@ -2023,7 +2224,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
-    labels: &std::collections::HashMap<String, String>,
+    labels: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -2072,8 +2273,12 @@ pub async fn sandbox_create(
                 return Err(err);
             }
             let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
-            let (new_tls, new_server, _) =
-                crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
+            let (new_tls, new_server, _) = Box::pin(crate::bootstrap::run_bootstrap(
+                remote,
+                ssh_key,
+                requested_gpu,
+            ))
+            .await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
@@ -2336,7 +2541,7 @@ pub async fn sandbox_create(
                             let label = if size_label.is_empty() {
                                 "Image pulled".to_string()
                             } else {
-                                format!("Image pulled ({})", size_label)
+                                format!("Image pulled ({size_label})")
                             };
                             if let Some(d) = display.as_mut() {
                                 d.complete_step_with_label(
@@ -2375,10 +2580,10 @@ pub async fn sandbox_create(
                     eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
                 }
             }
-            Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_)) => {
+            Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_))
+            | None => {
                 // Draft policy updates are handled in the draft panel, not during provisioning.
             }
-            None => {}
         }
     }
 
@@ -2436,7 +2641,7 @@ pub async fn sandbox_create(
                     )
                     .await?;
                 }
-                eprintln!("  {} Files uploaded", "\u{2713}".green().bold(),);
+                eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
             // If --forward was requested, start the background port forward
@@ -2625,14 +2830,10 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
 }
 
 fn source_requests_gpu(source: &str) -> bool {
-    if let Ok(resolved) = resolve_from(source) {
-        match resolved {
-            ResolvedSource::Image(image) => image_requests_gpu(&image),
-            ResolvedSource::Dockerfile { .. } => false,
-        }
-    } else {
-        false
-    }
+    resolve_from(source).is_ok_and(|resolved| match resolved {
+        ResolvedSource::Image(image) => image_requests_gpu(&image),
+        ResolvedSource::Dockerfile { .. } => false,
+    })
 }
 
 fn image_requests_gpu(image: &str) -> bool {
@@ -2816,14 +3017,14 @@ pub async fn sandbox_get(
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
 
     // Display labels if present
-    if let Some(metadata) = &sandbox.metadata {
-        if !metadata.labels.is_empty() {
-            println!("  {} ", "Labels:".dimmed());
-            let mut labels: Vec<_> = metadata.labels.iter().collect();
-            labels.sort_by_key(|(k, _)| *k);
-            for (key, value) in labels {
-                println!("    {}: {}", key, value);
-            }
+    if let Some(metadata) = &sandbox.metadata
+        && !metadata.labels.is_empty()
+    {
+        println!("  {} ", "Labels:".dimmed());
+        let mut labels: Vec<_> = metadata.labels.iter().collect();
+        labels.sort_by_key(|(k, _)| *k);
+        for (key, value) in labels {
+            println!("    {key}: {value}");
         }
     }
 
@@ -2903,7 +3104,9 @@ pub async fn sandbox_exec_grpc(
     // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
     // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
     // buffer more than the limit into memory.
-    let stdin_payload = if !std::io::stdin().is_terminal() {
+    let stdin_payload = if std::io::stdin().is_terminal() {
+        Vec::new()
+    } else {
         tokio::task::spawn_blocking(|| {
             let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
             let mut buf = Vec::new();
@@ -2921,8 +3124,6 @@ pub async fn sandbox_exec_grpc(
         })
         .await
         .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
-    } else {
-        Vec::new()
     };
 
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
@@ -3067,7 +3268,7 @@ pub async fn sandbox_list(
 
     if names_only {
         for sandbox in sandboxes {
-            println!("{}", sandbox.object_name().to_string());
+            println!("{}", sandbox.object_name());
         }
         return Ok(());
     }
@@ -3099,13 +3300,7 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
-        let created = format_epoch_ms(
-            sandbox
-                .metadata
-                .as_ref()
-                .map(|m| m.created_at_ms)
-                .unwrap_or(0),
-        );
+        let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
         println!(
             "{:<name_width$}  {:<created_width$}  {}",
             sandbox.object_name().to_string(),
@@ -3376,7 +3571,7 @@ async fn auto_create_provider(
                     id: String::new(),
                     name: exact_name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3394,7 +3589,7 @@ async fn auto_create_provider(
         eprintln!(
             "{} Created provider {} ({}) from existing local state",
             "✓".green().bold(),
-            provider.object_name().to_string(),
+            provider.object_name(),
             provider.r#type
         );
         if seen_names.insert(provider.object_name().to_string()) {
@@ -3416,7 +3611,7 @@ async fn auto_create_provider(
                         id: String::new(),
                         name: name.clone(),
                         created_at_ms: 0,
-                        labels: std::collections::HashMap::new(),
+                        labels: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -3433,7 +3628,7 @@ async fn auto_create_provider(
                     eprintln!(
                         "{} Created provider {} ({}) from existing local state",
                         "✓".green().bold(),
-                        provider.object_name().to_string(),
+                        provider.object_name(),
                         provider.r#type
                     );
                     if seen_names.insert(provider.object_name().to_string()) {
@@ -3574,7 +3769,7 @@ pub async fn provider_create(
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: provider_type,
                 credentials: credential_map,
@@ -3592,7 +3787,7 @@ pub async fn provider_create(
     println!(
         "{} Created provider {}",
         "✓".green().bold(),
-        provider.object_name().to_string()
+        provider.object_name()
     );
     Ok(())
 }
@@ -3616,12 +3811,8 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
 
     println!("{}", "Provider:".cyan().bold());
     println!();
-    println!("  {} {}", "Id:".dimmed(), provider.object_id().to_string());
-    println!(
-        "  {} {}",
-        "Name:".dimmed(),
-        provider.object_name().to_string()
-    );
+    println!("  {} {}", "Id:".dimmed(), provider.object_id());
+    println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
     println!(
         "  {} {}",
@@ -3668,7 +3859,7 @@ pub async fn provider_list(
 
     if names_only {
         for provider in providers {
-            println!("{}", provider.object_name().to_string());
+            println!("{}", provider.object_name());
         }
         return Ok(());
     }
@@ -3764,7 +3955,7 @@ pub async fn provider_update(
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -3782,7 +3973,7 @@ pub async fn provider_update(
     println!(
         "{} Updated provider {}",
         "✓".green().bold(),
-        provider.object_name().to_string()
+        provider.object_name()
     );
     Ok(())
 }
@@ -4374,9 +4565,9 @@ pub async fn sandbox_settings_get(
         "sandbox"
     };
 
-    println!("Sandbox:       {}", name);
+    println!("Sandbox:       {name}");
     println!("Config Rev:    {}", response.config_revision);
-    println!("Policy Source: {}", policy_source);
+    println!("Policy Source: {policy_source}");
     println!("Policy Hash:   {}", response.policy_hash);
 
     if response.settings.is_empty() {
@@ -4598,7 +4789,7 @@ pub async fn gateway_setting_delete(
             response.settings_revision
         );
     } else {
-        println!("{} Global setting {} not found", "!".yellow(), key,);
+        println!("{} Global setting {} not found", "!".yellow(), key);
     }
     Ok(())
 }
@@ -5121,6 +5312,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
 // Sandbox logs command
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn sandbox_logs(
     server: &str,
     name: &str,
@@ -5597,12 +5789,8 @@ mod tests {
             name: name.to_string(),
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
-            gateway_port: 0,
-            remote_host: None,
-            resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         }
     }
 
@@ -5984,13 +6172,8 @@ mod tests {
             GatewayMetadata {
                 name: "local".to_string(),
                 gateway_endpoint: "http://127.0.0.1:8080".to_string(),
-                is_remote: false,
                 gateway_port: 8080,
-                remote_host: None,
-                resolved_host: None,
-                auth_mode: None,
-                edge_team_domain: None,
-                edge_auth_url: None,
+                ..Default::default()
             },
         ];
 
@@ -6019,13 +6202,8 @@ mod tests {
         let gateway = GatewayMetadata {
             name: "local".to_string(),
             gateway_endpoint: "https://127.0.0.1:8080".to_string(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
 
         assert_eq!(gateway_auth_label(&gateway), "mtls");
@@ -6070,9 +6248,19 @@ mod tests {
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
             runtime.block_on(async {
-                gateway_add("http://127.0.0.1:8080", None, None, None, false)
-                    .await
-                    .expect("register plaintext gateway");
+                gateway_add(
+                    "http://127.0.0.1:8080",
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                )
+                .await
+                .expect("register plaintext gateway");
             });
 
             let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
@@ -6095,6 +6283,10 @@ mod tests {
                     None,
                     None,
                     true,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
                 )
                 .await
                 .expect("register plaintext gateway");

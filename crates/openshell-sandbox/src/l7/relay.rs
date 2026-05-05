@@ -7,16 +7,17 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{BodyLength, L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
+use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
+    NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -35,6 +36,58 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Per-endpoint credential strip/inject configuration.
+    pub(crate) cred_inject: Option<super::CredInjectConfig>,
+    /// When true, return post-rewrite headers as JSON instead of forwarding upstream.
+    pub(crate) echo: bool,
+    /// Trust cache for deps.dev lookups (shared across connections).
+    pub(crate) trust_cache: Option<Arc<crate::trust::TrustCache>>,
+    /// Per-endpoint trust check config (registry type).
+    pub(crate) trust_check: Option<super::TrustCheckConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParseRejectionMode {
+    L7Endpoint,
+    Passthrough,
+}
+
+fn parse_rejection_detail(error: &str, mode: ParseRejectionMode) -> String {
+    if error.contains("encoded '/' (%2F)") {
+        match mode {
+            ParseRejectionMode::L7Endpoint => format!(
+                "{error}; set allow_encoded_slash: true on this endpoint if the upstream requires encoded slashes"
+            ),
+            ParseRejectionMode::Passthrough => format!(
+                "{error}; passthrough credential relay uses strict path parsing, so configure this endpoint with protocol: rest and allow_encoded_slash: true for encoded-slash APIs, or use tls: skip if HTTP parsing is not needed"
+            ),
+        }
+    } else {
+        error.to_string()
+    }
+}
+
+fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
+    let policy_name = if ctx.policy_name.is_empty() {
+        "-"
+    } else {
+        &ctx.policy_name
+    };
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(policy_name, engine_type)
+        .message(format!(
+            "HTTP request rejected before policy evaluation for {}:{}",
+            ctx.host, ctx.port
+        ))
+        .status_detail(detail)
+        .build();
+    ocsf_emit!(event);
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -46,7 +99,7 @@ pub struct L7EvalContext {
 /// caller peeks on the raw `TcpStream` before calling this.
 pub async fn relay_with_inspection<C, U>(
     config: &L7EndpointConfig,
-    engine: Mutex<regorus::Engine>,
+    engine: TunnelPolicyEngine,
     client: &mut C,
     upstream: &mut U,
     ctx: &L7EvalContext,
@@ -58,6 +111,9 @@ where
     match config.protocol {
         L7Protocol::Rest => relay_rest(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
+            if close_if_stale(engine.generation_guard(), ctx) {
+                return Ok(());
+            }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {
                 let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
@@ -82,7 +138,7 @@ where
 /// switches to raw bidirectional TCP copy for the upgraded protocol (WebSocket,
 /// HTTP/2, etc.). L7 policy enforcement does not apply after the upgrade —
 /// the initial HTTP request was already evaluated.
-async fn handle_upgrade<C, U>(
+pub(crate) async fn handle_upgrade<C, U>(
     client: &mut C,
     upstream: &mut U,
     overflow: Vec<u8>,
@@ -119,7 +175,7 @@ where
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
 async fn relay_rest<C, U>(
     config: &L7EndpointConfig,
-    engine: &Mutex<regorus::Engine>,
+    engine: &TunnelPolicyEngine,
     client: &mut C,
     upstream: &mut U,
     ctx: &L7EvalContext,
@@ -137,6 +193,10 @@ where
             ..Default::default()
         });
     loop {
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
         // Parse one HTTP request from client
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
@@ -150,17 +210,17 @@ where
                         "L7 connection closed"
                     );
                 } else {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!("HTTP parse error in L7 relay: {e}"))
-                        .build();
-                    ocsf_emit!(event);
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7");
                 }
                 return Ok(()); // Close connection on parse error
             }
         };
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
 
         // Rewrite credential placeholders in the request target BEFORE OPA
         // evaluation. OPA sees the redacted path; the resolved path goes only
@@ -191,8 +251,32 @@ where
             query_params: req.query_params.clone(),
         };
 
+        // Trust check: extract package info and look up trust data.
+        let trust_result = if let (Some(tc), Some(cache)) = (&ctx.trust_check, &ctx.trust_cache) {
+            if let Some(registry) = crate::trust::Registry::parse(&tc.registry) {
+                if let Some(pkg) = crate::trust::parse_package_ref(
+                    registry,
+                    &request_info.action,
+                    &request_info.target,
+                ) {
+                    Some(cache.get_or_fetch(&pkg).await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) =
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?;
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
 
         // Check if this is an upgrade request for logging purposes.
         let header_end = req
@@ -218,13 +302,8 @@ where
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         {
             let (action_id, disposition_id, severity) = match decision_str {
-                "allow" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "audit" => (
+                "allow" | "audit" => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,
@@ -254,30 +333,126 @@ where
             ocsf_emit!(event);
         }
 
+        // Trust-specific OCSF events
+        if let Some(ref trust) = trust_result {
+            if trust.lookup_failed {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Low)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_LOOKUP_FAILED {} {}@{} — allowing (fail-open)",
+                        request_info.action, trust.package_name, trust.version,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.critical_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_DENIED {} {}@{} — {} critical vulnerabilities",
+                        request_info.action,
+                        trust.package_name,
+                        trust.version,
+                        trust.critical_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.high_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Medium)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_AUDIT {} {}@{} — {} high vulnerabilities",
+                        request_info.action, trust.package_name, trust.version, trust.high_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            }
+        }
+
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_resolver(
-                &req,
-                client,
-                upstream,
-                ctx.secret_resolver.as_deref(),
-            )
-            .await?;
-            match outcome {
-                RelayOutcome::Reusable => {} // continue loop
-                RelayOutcome::Consumed => {
-                    debug!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        "Upstream connection not reusable, closing L7 relay"
-                    );
-                    return Ok(());
+            if ctx.echo {
+                // Echo mode: drain request body, then return post-rewrite headers as JSON.
+                let header_end = req
+                    .raw_header
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(req.raw_header.len(), |p| p + 4);
+                let overflow_len = req.raw_header[header_end..].len() as u64;
+                if let BodyLength::ContentLength(len) = req.body_length {
+                    let remaining = len.saturating_sub(overflow_len);
+                    if remaining > 0 {
+                        let mut discard = tokio::io::sink();
+                        let mut take = (&mut *client).take(remaining);
+                        tokio::io::copy(&mut take, &mut discard)
+                            .await
+                            .into_diagnostic()?;
+                    }
                 }
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+
+                let outcome = crate::l7::rest::echo_http_request(
+                    &req,
+                    client,
+                    ctx.secret_resolver.as_deref(),
+                    ctx.cred_inject.as_ref(),
+                    &ctx.policy_name,
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {}
+                    _ => return Ok(()),
+                }
+            } else {
+                // Forward request to upstream and relay response
+                let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                    &req,
+                    client,
+                    upstream,
+                    ctx.secret_resolver.as_deref(),
+                    Some(engine.generation_guard()),
+                    ctx.cred_inject.as_ref(),
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {} // continue loop
+                    RelayOutcome::Consumed => {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            "Upstream connection not reusable, closing L7 relay"
+                        );
+                        return Ok(());
+                    }
+                    RelayOutcome::Upgraded { overflow } => {
+                        return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port)
+                            .await;
+                    }
                 }
             }
         } else {
@@ -294,6 +469,32 @@ where
             return Ok(());
         }
     }
+}
+
+fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
+    if !guard.is_stale() {
+        return false;
+    }
+
+    ocsf_emit!(
+        NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+            .firewall_rule(&ctx.policy_name, "l7")
+            .message(format!(
+                "L7 tunnel closed after policy reload [host:{} port:{} captured_generation:{} current_generation:{}]",
+                ctx.host,
+                ctx.port,
+                guard.captured_generation(),
+                guard.current_generation(),
+            ))
+            .build()
+    );
+    true
 }
 
 /// Check if a miette error represents a benign connection close.
@@ -318,11 +519,20 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 ///
 /// Returns `(allowed, deny_reason)`.
 pub fn evaluate_l7_request(
-    engine: &Mutex<regorus::Engine>,
+    engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
+    trust: Option<&crate::trust::TrustResult>,
 ) -> Result<(bool, String)> {
-    let input_json = serde_json::json!({
+    if engine.is_stale() {
+        return Err(miette!(
+            "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
+            engine.captured_generation(),
+            engine.current_generation(),
+        ));
+    }
+
+    let mut input_json = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -339,7 +549,23 @@ pub fn evaluate_l7_request(
         }
     });
 
+    if let Some(trust) = trust {
+        input_json["trust"] = serde_json::json!({
+            "package": trust.package_name,
+            "version": trust.version,
+            "registry": trust.registry,
+            "critical_vulns": trust.critical_vulns,
+            "high_vulns": trust.high_vulns,
+            "medium_vulns": trust.medium_vulns,
+            "low_vulns": trust.low_vulns,
+            "license": trust.license,
+            "is_stale": trust.is_stale,
+            "lookup_failed": trust.lookup_failed,
+        });
+    }
+
     let mut engine = engine
+        .engine()
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
 
@@ -377,6 +603,7 @@ pub async fn relay_passthrough_with_credentials<C, U>(
     client: &mut C,
     upstream: &mut U,
     ctx: &L7EvalContext,
+    generation_guard: &PolicyGenerationGuard,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -391,6 +618,10 @@ where
     let resolver = ctx.secret_resolver.as_deref();
 
     loop {
+        if close_if_stale(generation_guard, ctx) {
+            return Ok(());
+        }
+
         // Read next request from client.
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
@@ -399,9 +630,16 @@ where
                 if is_benign_connection_error(&e) {
                     break;
                 }
-                return Err(e);
+                let detail =
+                    parse_rejection_detail(&e.to_string(), ParseRejectionMode::Passthrough);
+                emit_parse_rejection(ctx, &detail, "http-parser");
+                return Ok(());
             }
         };
+
+        if close_if_stale(generation_guard, ctx) {
+            return Ok(());
+        }
 
         request_count += 1;
 
@@ -451,9 +689,15 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let outcome =
-            crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
-                .await?;
+        let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            &req,
+            client,
+            upstream,
+            resolver,
+            Some(generation_guard),
+            None,
+        )
+        .await?;
 
         match outcome {
             RelayOutcome::Reusable => {} // continue loop
@@ -472,4 +716,264 @@ where
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opa::{NetworkInput, OpaEngine};
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+
+    #[test]
+    fn parse_rejection_detail_adds_l7_hint_for_encoded_slash() {
+        let detail = parse_rejection_detail(
+            "HTTP request-target rejected: request-target contains an encoded '/' (%2F) which is not allowed on this endpoint",
+            ParseRejectionMode::L7Endpoint,
+        );
+
+        assert!(detail.contains("allow_encoded_slash: true"));
+        assert!(detail.contains("upstream requires encoded slashes"));
+    }
+
+    #[test]
+    fn parse_rejection_detail_adds_passthrough_hint_for_encoded_slash() {
+        let detail = parse_rejection_detail(
+            "HTTP request-target rejected: request-target contains an encoded '/' (%2F) which is not allowed on this endpoint",
+            ParseRejectionMode::Passthrough,
+        );
+
+        assert!(detail.contains("protocol: rest"));
+        assert!(detail.contains("allow_encoded_slash: true"));
+        assert!(detail.contains("tls: skip"));
+    }
+
+    #[test]
+    fn parse_rejection_detail_preserves_other_errors() {
+        let error = "HTTP headers contain invalid UTF-8";
+
+        assert_eq!(
+            parse_rejection_detail(error, ParseRejectionMode::L7Endpoint),
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn l7_relay_closes_keep_alive_tunnel_after_policy_generation_change() {
+        let initial_data = r#"
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/write"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let reloaded_data = r#"
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/write"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, initial_data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"POST /write HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut first_upstream = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut first_upstream),
+        )
+        .await
+        .expect("first request should reach upstream")
+        .unwrap();
+        let first_upstream = String::from_utf8_lossy(&first_upstream[..n]);
+        assert!(first_upstream.starts_with("POST /write HTTP/1.1"));
+
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
+            .await
+            .unwrap();
+
+        let mut first_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut first_response),
+        )
+        .await
+        .expect("first response should reach client")
+        .unwrap();
+        let first_response = String::from_utf8_lossy(&first_response[..n]);
+        assert!(first_response.contains("200 OK"));
+
+        engine.reload(TEST_POLICY, reloaded_data).unwrap();
+        app.write_all(
+            b"POST /write HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should close stale tunnel")
+            .unwrap()
+            .unwrap();
+
+        let mut second_upstream = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut second_upstream),
+        )
+        .await
+        .expect("upstream side should close")
+        .unwrap();
+        assert_eq!(n, 0, "stale request must not be forwarded upstream");
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_closes_keep_alive_tunnel_after_policy_generation_change() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /first HTTP/1.1\r\nHost: api.example.test\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut first_upstream = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut first_upstream),
+        )
+        .await
+        .expect("first passthrough request should reach upstream")
+        .unwrap();
+        let first_upstream = String::from_utf8_lossy(&first_upstream[..n]);
+        assert!(first_upstream.starts_with("GET /first HTTP/1.1"));
+
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
+            .await
+            .unwrap();
+
+        let mut first_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut first_response),
+        )
+        .await
+        .expect("first passthrough response should reach client")
+        .unwrap();
+        let first_response = String::from_utf8_lossy(&first_response[..n]);
+        assert!(first_response.contains("200 OK"));
+
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+        app.write_all(
+            b"GET /second HTTP/1.1\r\nHost: api.example.test\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("passthrough relay should close stale tunnel")
+            .unwrap()
+            .unwrap();
+
+        let mut second_upstream = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut second_upstream),
+        )
+        .await
+        .expect("upstream side should close")
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "stale passthrough request must not be forwarded upstream"
+        );
+    }
 }

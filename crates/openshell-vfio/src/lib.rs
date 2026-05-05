@@ -591,7 +591,8 @@ fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, VfioError> 
         bdf: bdf.to_string(),
         reason: format!(
             "after drivers_probe with {}ms polling, driver is {:?} instead of vfio-pci",
-            VFIO_BIND_MAX_POLL_ATTEMPTS as u64 * VFIO_BIND_POLL_INTERVAL.as_millis() as u64,
+            u64::from(VFIO_BIND_MAX_POLL_ATTEMPTS)
+                * u64::try_from(VFIO_BIND_POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             current_driver_name(sysfs, bdf)
                 .as_deref()
                 .unwrap_or("<none>")
@@ -844,7 +845,16 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::sync::{MutexGuard, PoisonError};
     use tempfile::TempDir;
+
+    static VFIO_ID_REFCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn vfio_id_refcount_test_guard() -> MutexGuard<'static, ()> {
+        VFIO_ID_REFCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 
     fn setup_mock_sysfs() -> (TempDir, SysfsRoot) {
         let tmp = TempDir::new().unwrap();
@@ -1132,6 +1142,7 @@ mod tests {
 
     #[test]
     fn test_register_vfio_new_id_writes_vendor_device() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b3");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1156,6 +1167,7 @@ mod tests {
 
     #[test]
     fn test_register_vfio_new_id_ignores_missing_new_id_file() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b4");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1176,6 +1188,7 @@ mod tests {
 
     #[test]
     fn test_deregister_vfio_new_id_writes_vendor_device() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b5");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1200,6 +1213,7 @@ mod tests {
 
     #[test]
     fn test_deregister_vfio_new_id_ignores_missing_remove_id_file() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b6");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1219,6 +1233,7 @@ mod tests {
 
     #[test]
     fn test_register_deregister_refcount() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b8");
         let (tmp, sysfs) = setup_mock_sysfs();
 
@@ -1297,6 +1312,8 @@ mod tests {
 
     #[test]
     fn test_prepare_gpu_skips_already_bound_companions() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
+        clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
             &sysfs,
@@ -1334,6 +1351,8 @@ mod tests {
 
     #[test]
     fn test_prepare_gpu_solo_iommu_group_no_companions() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
+        clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
             &sysfs,
@@ -1381,6 +1400,7 @@ mod tests {
 
     #[test]
     fn test_guard_drop_restores_companions() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1451,6 +1471,8 @@ mod tests {
 
     #[test]
     fn test_guard_disarm_skips_restore() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
+        clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
             &sysfs,
@@ -1488,6 +1510,7 @@ mod tests {
 
     #[test]
     fn test_restore_gpu_deregisters_new_id_before_reprobe() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 26b7");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
@@ -1528,6 +1551,7 @@ mod tests {
 
     #[test]
     fn test_reconcile_clears_stale_driver_override_when_not_on_vfio() {
+        let _refcount_guard = vfio_id_refcount_test_guard();
         clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(

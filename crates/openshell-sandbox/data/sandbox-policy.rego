@@ -219,6 +219,10 @@ deny_request if {
 	_policy_denies_l7(policy)
 }
 
+deny_request if {
+	deny_trust_critical
+}
+
 # --- L7 deny rule matching: REST method + path + query ---
 
 request_denied_for_endpoint(request, endpoint) if {
@@ -287,8 +291,17 @@ deny_any_value_matches(values, matcher) if {
 # --- L7 deny reason ---
 
 request_deny_reason := reason if {
+	input.trust
+	deny_trust_critical
+	pkg := object.get(input.trust, "package", "unknown")
+	version := object.get(input.trust, "version", "unknown")
+	reason := sprintf("package %s@%s has critical vulnerabilities", [pkg, version])
+}
+
+request_deny_reason := reason if {
 	input.request
 	deny_request
+	not deny_trust_critical
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
 }
 
@@ -399,6 +412,26 @@ command_matches(actual, expected) if {
 	upper(actual) == upper(expected)
 }
 
+# --- Trust-API package trust evaluation ---
+
+# Deny if package has critical vulnerabilities.
+deny_trust_critical if {
+	input.trust
+	input.trust.critical_vulns > 0
+}
+
+# Audit (allow but log) if package has high vulnerabilities.
+audit_trust_high if {
+	input.trust
+	input.trust.high_vulns > 0
+}
+
+# Audit if trust lookup failed (fail-open with visibility).
+audit_trust_lookup_failed if {
+	input.trust
+	input.trust.lookup_failed == true
+}
+
 # --- Matched endpoint config (for L7 and allowed_ips extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
 # Used by Rust to extract L7 config (protocol, tls, enforcement,
@@ -424,6 +457,14 @@ _matching_endpoint_configs := [cfg |
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
+}
+
+# Return the allowed_secrets list from the matched network policy rule.
+# Empty list (or absent field) means all credentials are allowed.
+matched_allowed_secrets := secrets if {
+	matched_network_policy
+	policy := data.network_policies[matched_network_policy]
+	secrets := object.get(policy, "allowed_secrets", [])
 }
 
 # Hosted endpoint: exact host match + port in ports list.

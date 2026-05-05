@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
-pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
+pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
@@ -23,7 +23,7 @@ fn is_env_key_char(b: u8) -> bool {
 /// Error returned when a placeholder cannot be resolved or a resolved secret
 /// contains prohibited characters.
 #[derive(Debug)]
-pub(crate) struct UnresolvedPlaceholderError {
+pub struct UnresolvedPlaceholderError {
     pub location: &'static str, // "header", "query_param", "path"
 }
 
@@ -39,18 +39,28 @@ impl fmt::Display for UnresolvedPlaceholderError {
 
 /// Result of rewriting an HTTP header block with credential resolution.
 #[derive(Debug)]
-pub(crate) struct RewriteResult {
+pub struct RewriteResult {
     /// The rewritten HTTP bytes (headers + body overflow).
     pub rewritten: Vec<u8>,
     /// A redacted version of the request target for logging.
     /// Contains `[CREDENTIAL]` in place of resolved credential values.
     /// `None` if the target was not modified.
+    // Kept on the public result struct as part of the API contract; consumed
+    // selectively by callers that emit redacted logs.
+    #[allow(dead_code)]
     pub redacted_target: Option<String>,
+}
+
+/// Directive to strip one header and inject a replacement from the credential resolver.
+#[derive(Debug, Clone)]
+pub(crate) struct CredInjectDirective {
+    pub header: String,
+    pub from_credential: String,
 }
 
 /// Result of rewriting a request target for OPA evaluation.
 #[derive(Debug)]
-pub(crate) struct RewriteTargetResult {
+pub struct RewriteTargetResult {
     /// The resolved target (real secrets) — for upstream forwarding only.
     pub resolved: String,
     /// The redacted target (`[CREDENTIAL]` in place of secrets) — for OPA + logs.
@@ -105,6 +115,36 @@ impl SecretResolver {
         }
     }
 
+    /// Resolve a credential by its environment variable key name (e.g. `"ANTHROPIC_API_KEY"`).
+    ///
+    /// Builds the canonical placeholder and delegates to `resolve_placeholder`.
+    /// Returns `None` if the key is unknown or the value is invalid.
+    pub(crate) fn resolve_by_env_key(&self, key: &str) -> Option<&str> {
+        let placeholder = placeholder_for_env_key(key);
+        self.resolve_placeholder(&placeholder)
+    }
+
+    /// Create a new resolver containing only the specified credential keys.
+    /// If `allowed_keys` is empty, returns a clone with all credentials
+    /// (backward compatible — empty means "no restriction").
+    pub(crate) fn filtered(&self, allowed_keys: &[String]) -> Self {
+        if allowed_keys.is_empty() {
+            return self.clone();
+        }
+        let allowed_placeholders: HashSet<String> = allowed_keys
+            .iter()
+            .map(|k| placeholder_for_env_key(k))
+            .collect();
+        Self {
+            by_placeholder: self
+                .by_placeholder
+                .iter()
+                .filter(|(k, _)| allowed_placeholders.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+
     pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
         // Direct placeholder match: `x-api-key: openshell:resolve:env:KEY`
         if let Some(secret) = self.resolve_placeholder(value.trim()) {
@@ -119,10 +159,9 @@ impl SecretResolver {
             .strip_prefix("Basic ")
             .or_else(|| trimmed.strip_prefix("basic "))
             .map(str::trim)
+            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)
         {
-            if let Some(rewritten) = self.rewrite_basic_auth_token(encoded) {
-                return Some(format!("Basic {rewritten}"));
-            }
+            return Some(format!("Basic {rewritten}"));
         }
 
         // Prefixed placeholder: `Bearer openshell:resolve:env:KEY`
@@ -172,7 +211,7 @@ impl SecretResolver {
     }
 }
 
-pub(crate) fn placeholder_for_env_key(key: &str) -> String {
+pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
 }
 
@@ -226,12 +265,26 @@ fn percent_encode_path_segment(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
-            // unreserved
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            // sub-delims + ":" + "@"
-            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':'
+            // unreserved + sub-delims + ":" + "@"
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
             | b'@' => {
                 encoded.push(byte as char);
             }
@@ -254,11 +307,11 @@ fn percent_decode(input: &str) -> String {
             let lo = bytes.next();
             if let (Some(h), Some(l)) = (hi, lo) {
                 let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(val) = u8::from_str_radix(s, 16) {
-                        decoded.push(val);
-                        continue;
-                    }
+                if let Ok(s) = std::str::from_utf8(&hex)
+                    && let Ok(val) = u8::from_str_radix(s, 16)
+                {
+                    decoded.push(val);
+                    continue;
                 }
                 // Invalid percent encoding — preserve verbatim
                 decoded.push(b'%');
@@ -318,46 +371,34 @@ struct RewriteLineResult {
 ///
 /// Given a request line like `GET /bot{TOKEN}/path?key={APIKEY} HTTP/1.1`,
 /// resolves placeholders in both path segments and query parameter values.
+// `resolver` (the credential resolver) and `resolved` (the resolved string
+// output) are intentionally distinct nouns; renaming would obscure intent.
+#[allow(clippy::similar_names)]
 fn rewrite_request_line(
     line: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteLineResult, UnresolvedPlaceholderError> {
     // Request line format: METHOD SP REQUEST-URI SP HTTP-VERSION
     let mut parts = line.splitn(3, ' ');
-    let method = match parts.next() {
-        Some(m) => m,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let unchanged = || {
+        Ok(RewriteLineResult {
+            line: line.to_string(),
+            redacted_target: None,
+        })
     };
-    let uri = match parts.next() {
-        Some(u) => u,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let Some(method) = parts.next() else {
+        return unchanged();
     };
-    let version = match parts.next() {
-        Some(v) => v,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let Some(uri) = parts.next() else {
+        return unchanged();
+    };
+    let Some(version) = parts.next() else {
+        return unchanged();
     };
 
     // Only rewrite if the URI contains a placeholder
     if !uri.contains(PLACEHOLDER_PREFIX) {
-        return Ok(RewriteLineResult {
-            line: line.to_string(),
-            redacted_target: None,
-        });
+        return unchanged();
     }
 
     // Split URI into path and query
@@ -382,9 +423,10 @@ fn rewrite_request_line(
     };
 
     // Reassemble
-    let resolved_uri = match &resolved_query {
-        Some(q) => format!("{resolved_path}?{q}"),
-        None => resolved_path.clone(),
+    let resolved_uri = if let Some(q) = resolved_query.as_ref() {
+        format!("{resolved_path}?{q}")
+    } else {
+        resolved_path
     };
     let redacted_uri = match &redacted_query {
         Some(q) => format!("{redacted_path}?{q}"),
@@ -404,6 +446,9 @@ fn rewrite_request_line(
 ///
 /// Returns `Some((resolved_path, redacted_path))` if any placeholders were found,
 /// `None` if no placeholders exist in the path.
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
 fn rewrite_uri_path(
     path: &str,
     resolver: &SecretResolver,
@@ -446,6 +491,9 @@ fn rewrite_uri_path(
 ///
 /// Uses the placeholder grammar `openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*`
 /// to determine placeholder boundaries within concatenated text.
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
 fn rewrite_path_segment(
     segment: &str,
     resolver: &SecretResolver,
@@ -561,7 +609,7 @@ fn rewrite_uri_query_params(
 ///
 /// Returns `Err` if any placeholder is detected but cannot be resolved
 /// (fail-closed behavior).
-pub(crate) fn rewrite_http_header_block(
+pub fn rewrite_http_header_block(
     raw: &[u8],
     resolver: Option<&SecretResolver>,
 ) -> Result<RewriteResult, UnresolvedPlaceholderError> {
@@ -627,22 +675,25 @@ pub(crate) fn rewrite_http_header_block(
     })
 }
 
-pub(crate) fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
+pub fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
     };
 
-    match resolver.rewrite_header_value(value.trim()) {
-        Some(rewritten) => format!("{name}: {rewritten}"),
-        None => line.to_string(),
-    }
+    resolver.rewrite_header_value(value.trim()).map_or_else(
+        || line.to_string(),
+        |rewritten| format!("{name}: {rewritten}"),
+    )
 }
 
 /// Resolve placeholders in a request target (path + query) for OPA evaluation.
 ///
 /// Returns the resolved target (real secrets, for upstream) and a redacted
 /// version (`[CREDENTIAL]` in place of secrets, for OPA input and logs).
-pub(crate) fn rewrite_target_for_eval(
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
+pub fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
@@ -691,10 +742,107 @@ pub(crate) fn rewrite_target_for_eval(
 }
 
 // ---------------------------------------------------------------------------
+// Credential inject (strip-and-replace pass)
+// ---------------------------------------------------------------------------
+
+/// Strip named headers and inject replacements from the credential resolver.
+///
+/// This is a second-pass operation applied **after** `rewrite_http_header_block`.
+/// It unconditionally removes headers whose names appear in `strip_headers` and
+/// appends new headers sourced from the resolver using `inject` directives.
+///
+/// # Fail-closed
+///
+/// If any inject directive references a credential that cannot be resolved,
+/// the function returns `Err(UnresolvedPlaceholderError { location: "cred_inject" })`
+/// rather than forwarding a request with a missing or placeholder credential.
+///
+/// # No-op fast path
+///
+/// If both `strip_headers` and `inject` are empty, the input is returned unchanged.
+pub(crate) fn apply_cred_inject(
+    raw: &[u8],
+    strip_headers: &[String],
+    inject: &[CredInjectDirective],
+    resolver: &SecretResolver,
+) -> Result<Vec<u8>, UnresolvedPlaceholderError> {
+    // Fast path: nothing to do.
+    if strip_headers.is_empty() && inject.is_empty() {
+        return Ok(raw.to_vec());
+    }
+
+    // Locate the end of the header block (\r\n\r\n).
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+        return Ok(raw.to_vec());
+    };
+
+    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = header_str.split("\r\n");
+
+    // Preserve the request line verbatim.
+    let Some(request_line) = lines.next() else {
+        return Ok(raw.to_vec());
+    };
+
+    // Pre-resolve all inject directives up front (fail-closed).
+    let mut resolved_injections: Vec<(&str, &str)> = Vec::with_capacity(inject.len());
+    for directive in inject {
+        let value = resolver
+            .resolve_by_env_key(&directive.from_credential)
+            .ok_or(UnresolvedPlaceholderError {
+                location: "cred_inject",
+            })?;
+        resolved_injections.push((&directive.header, value));
+    }
+
+    let mut output = Vec::with_capacity(raw.len() + inject.len() * 64);
+    output.extend_from_slice(request_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Copy headers, skipping those in the strip list (case-insensitive).
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, _)) = line.split_once(':') {
+            let name_lower = name.trim().to_ascii_lowercase();
+            if strip_headers
+                .iter()
+                .any(|h| h.to_ascii_lowercase() == name_lower)
+            {
+                continue;
+            }
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    // Append injected headers.
+    for (header, value) in &resolved_injections {
+        output.extend_from_slice(header.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    // Terminate the header block.
+    output.extend_from_slice(b"\r\n");
+
+    // Append any body bytes that followed the header block.
+    output.extend_from_slice(&raw[header_end..]);
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::iter_on_single_items,
+    reason = "Test code: single-key fixtures are clearer as array literals than std::iter::once."
+)]
 mod tests {
     use super::*;
 
@@ -1472,5 +1620,329 @@ mod tests {
 
         assert_eq!(result.resolved, "/bottok123/method?key=key456");
         assert_eq!(result.redacted, "/bot[CREDENTIAL]/method?key=[CREDENTIAL]");
+    }
+
+    // === resolve_by_env_key tests ===
+
+    #[test]
+    fn resolve_by_env_key_returns_secret() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("ANTHROPIC_API_KEY".to_string(), "sk-real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            resolver.resolve_by_env_key("ANTHROPIC_API_KEY"),
+            Some("sk-real")
+        );
+        assert_eq!(resolver.resolve_by_env_key("UNKNOWN_KEY"), None);
+    }
+
+    // === filtered resolver tests ===
+
+    #[test]
+    fn filtered_resolver_only_resolves_allowed_keys() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+            ("NPM_TOKEN".into(), "npm-789".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        let filtered = resolver.filtered(&["GITHUB_TOKEN".to_string()]);
+
+        assert_eq!(
+            filtered.resolve_by_env_key("GITHUB_TOKEN"),
+            Some("ghp-github-456")
+        );
+        assert_eq!(filtered.resolve_by_env_key("ANTHROPIC_API_KEY"), None);
+        assert_eq!(filtered.resolve_by_env_key("NPM_TOKEN"), None);
+    }
+
+    #[test]
+    fn filtered_resolver_empty_allows_all() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        let filtered = resolver.filtered(&[]);
+
+        assert_eq!(
+            filtered.resolve_by_env_key("ANTHROPIC_API_KEY"),
+            Some("sk-anthropic-123")
+        );
+        assert_eq!(
+            filtered.resolve_by_env_key("GITHUB_TOKEN"),
+            Some("ghp-github-456")
+        );
+    }
+
+    // === apply_cred_inject tests ===
+
+    #[test]
+    fn apply_cred_inject_strips_and_injects() {
+        // Provider has the real key; agent environment carries the placeholder.
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-provider-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let agent_placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+
+        // Agent sends both an Authorization header (leaked placeholder) and an
+        // x-api-key header.  Both should be stripped and replaced by the
+        // injected provider key.
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Authorization: Bearer {agent_placeholder}\r\n\
+             x-api-key: {agent_placeholder}\r\n\
+             Content-Type: application/json\r\n\r\n"
+        );
+
+        let strip = vec!["Authorization".to_string(), "x-api-key".to_string()];
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".to_string(),
+            from_credential: "ANTHROPIC_API_KEY".to_string(),
+        }];
+
+        let result =
+            apply_cred_inject(raw.as_bytes(), &strip, &inject, &resolver).expect("should succeed");
+        let rewritten = String::from_utf8(result).expect("utf8");
+
+        // Request line preserved
+        assert!(rewritten.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        // Both stripped headers gone
+        assert!(!rewritten.contains("Authorization:"));
+        assert!(!rewritten.contains(&format!("x-api-key: {agent_placeholder}")));
+        // Injected header present with real value
+        assert!(rewritten.contains("x-api-key: sk-provider-key\r\n"));
+        // Unrelated header preserved
+        assert!(rewritten.contains("Content-Type: application/json\r\n"));
+        // No placeholder leakage
+        assert!(!rewritten.contains("openshell:resolve:env:"));
+    }
+
+    #[test]
+    fn apply_cred_inject_case_insensitive_strip() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        // Config strip list uses lowercase; request sends mixed-case header.
+        let raw = b"GET / HTTP/1.1\r\nX-Api-Key: some-value\r\nAccept: */*\r\n\r\n";
+        let strip = vec!["x-api-key".to_string()];
+
+        let result = apply_cred_inject(raw, &strip, &[], &resolver).expect("should succeed");
+        let rewritten = String::from_utf8(result).expect("utf8");
+
+        assert!(
+            !rewritten.contains("X-Api-Key:"),
+            "Mixed-case header should be stripped"
+        );
+        assert!(
+            rewritten.contains("Accept: */*\r\n"),
+            "Unrelated header should survive"
+        );
+    }
+
+    #[test]
+    fn apply_cred_inject_fails_on_missing_credential() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("EXISTING_KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".to_string(),
+            from_credential: "NONEXISTENT_KEY".to_string(),
+        }];
+
+        let result = apply_cred_inject(raw, &[], &inject, &resolver);
+        assert!(result.is_err(), "Missing credential should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.location, "cred_inject");
+    }
+
+    #[test]
+    fn apply_cred_inject_no_op_when_empty() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = apply_cred_inject(raw, &[], &[], &resolver).expect("should succeed");
+
+        assert_eq!(
+            raw.as_slice(),
+            result.as_slice(),
+            "Output should equal input when no-op"
+        );
+    }
+
+    // === Integration test: per-binary credential scoping ===
+
+    #[test]
+    fn filtered_resolver_blocks_cred_inject_for_wrong_binary() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".into(), "sk-anthropic-123".into()),
+            ("GITHUB_TOKEN".into(), "ghp-github-456".into()),
+        ]);
+        let (_child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        // Simulate: gh binary can only use GITHUB_TOKEN
+        let gh_resolver = resolver.filtered(&["GITHUB_TOKEN".to_string()]);
+
+        // gh tries to inject ANTHROPIC_API_KEY via cred_inject → should fail
+        let raw = b"GET /repos HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".into(),
+            from_credential: "ANTHROPIC_API_KEY".into(),
+        }];
+        let result = apply_cred_inject(raw, &[], &inject, &gh_resolver);
+        assert!(result.is_err(), "gh should not resolve ANTHROPIC_API_KEY");
+
+        // gh tries to inject GITHUB_TOKEN → should succeed
+        let inject_github = vec![CredInjectDirective {
+            header: "Authorization".into(),
+            from_credential: "GITHUB_TOKEN".into(),
+        }];
+        let result = apply_cred_inject(raw, &[], &inject_github, &gh_resolver);
+        assert!(result.is_ok());
+        let bytes = result.unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains("Authorization: ghp-github-456"));
+    }
+
+    // === Integration test: end-to-end strip-and-replace pipeline ===
+
+    #[test]
+    fn cred_inject_overrides_placeholder_rewriting() {
+        // Setup: provider env creates placeholders
+        let env = HashMap::from([("ANTHROPIC_API_KEY".into(), "sk-real-provider-key".into())]);
+        let (child_env, resolver) = SecretResolver::from_provider_env(env);
+        let resolver = resolver.unwrap();
+
+        // Agent sends request with the placeholder (normal flow)
+        let placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+        let raw = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: api.anthropic.com\r\n\
+             x-api-key: {placeholder}\r\n\
+             Authorization: Bearer smuggled-token\r\n\
+             Content-Type: application/json\r\n\
+             \r\n"
+        );
+
+        // Step 1: normal placeholder rewriting (existing behavior)
+        let rewrite_result = rewrite_http_header_block(raw.as_bytes(), Some(&resolver)).unwrap();
+
+        // Step 2: cred_inject strips and re-injects
+        let strip = vec!["x-api-key".to_string(), "Authorization".to_string()];
+        let inject = vec![CredInjectDirective {
+            header: "x-api-key".into(),
+            from_credential: "ANTHROPIC_API_KEY".into(),
+        }];
+        let final_result =
+            apply_cred_inject(&rewrite_result.rewritten, &strip, &inject, &resolver).unwrap();
+
+        let output = String::from_utf8_lossy(&final_result);
+        // Real key injected by cred_inject
+        assert!(output.contains("x-api-key: sk-real-provider-key"));
+        // Smuggled Authorization stripped
+        assert!(!output.contains("smuggled-token"));
+        // Other headers preserved
+        assert!(output.contains("Content-Type: application/json"));
+    }
+
+    // === ArcSwapOption live-reload tests ===
+
+    #[test]
+    fn arcswap_resolver_hot_swap_updates_credentials() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let env = HashMap::from([("API_KEY".into(), "old-secret".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        let shared = Arc::new(ArcSwapOption::from(resolver.map(Arc::new)));
+
+        // Connection 1 sees the old secret.
+        let snap1: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap1.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("old-secret")
+        );
+
+        // Simulate provider poll: credentials rotate.
+        let new_env = HashMap::from([("API_KEY".into(), "new-secret".into())]);
+        let (_, new_resolver) = SecretResolver::from_provider_env(new_env);
+        shared.store(new_resolver.map(Arc::new));
+
+        // Connection 2 sees the new secret.
+        let snap2: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap2.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("new-secret")
+        );
+
+        // Connection 1's snapshot is unchanged (point-in-time isolation).
+        assert_eq!(
+            snap1.as_ref().unwrap().resolve_by_env_key("API_KEY"),
+            Some("old-secret")
+        );
+    }
+
+    #[test]
+    fn arcswap_resolver_starts_empty_then_populated() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let shared: Arc<ArcSwapOption<SecretResolver>> = Arc::new(ArcSwapOption::empty());
+
+        assert!(shared.load_full().is_none());
+
+        let env = HashMap::from([("TOKEN".into(), "tok-123".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        shared.store(resolver.map(Arc::new));
+
+        let snap: Option<Arc<SecretResolver>> = shared.load_full();
+        assert_eq!(
+            snap.as_ref().unwrap().resolve_by_env_key("TOKEN"),
+            Some("tok-123")
+        );
+    }
+
+    #[test]
+    fn arcswap_resolver_can_be_cleared() {
+        use arc_swap::ArcSwapOption;
+        use std::sync::Arc;
+
+        let env = HashMap::from([("KEY".into(), "val".into())]);
+        let (_, resolver) = SecretResolver::from_provider_env(env);
+        let shared = Arc::new(ArcSwapOption::from(resolver.map(Arc::new)));
+
+        assert!(shared.load_full().is_some());
+
+        shared.store(None);
+        assert!(shared.load_full().is_none());
     }
 }

@@ -9,7 +9,7 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
     DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -22,9 +22,17 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
-    /// Port to bind the server to (all interfaces).
+    /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
+
+    /// Address to bind the server to.
+    #[arg(
+        long,
+        default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        env = "OPENSHELL_BIND_ADDRESS"
+    )]
+    bind_address: IpAddr,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
     /// Set to 0 to disable the dedicated health listener.
@@ -61,12 +69,14 @@ struct Args {
     /// Accepts a comma-delimited list such as `kubernetes` or
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
+    /// When unset, the gateway auto-detects the driver based on the runtime
+    /// environment (Kubernetes → Podman → Docker). VM is never auto-detected
+    /// and requires explicit configuration.
     #[arg(
         long,
         alias = "driver",
         env = "OPENSHELL_DRIVERS",
         value_delimiter = ',',
-        default_value = "kubernetes",
         value_parser = parse_compute_driver
     )]
     drivers: Vec<ComputeDriverKind>,
@@ -79,7 +89,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// Kubernetes imagePullPolicy for sandbox pods (Always, IfNotPresent, Never).
+    /// Kubernetes `imagePullPolicy` for sandbox pods (Always, `IfNotPresent`, Never).
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
 
@@ -136,8 +146,9 @@ struct Args {
     /// Directory searched for compute-driver binaries (e.g.
     /// `openshell-driver-vm`) when an explicit binary override isn't
     /// configured. When unset, the gateway searches
-    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    /// `$HOME/.local/libexec/openshell`, `/usr/libexec/openshell`,
+    /// `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling
+    /// of the gateway binary.
     #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
     driver_dir: Option<PathBuf>,
 
@@ -215,6 +226,51 @@ struct Args {
     /// certificate. Ignored when --disable-tls is set.
     #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
+
+    /// OIDC issuer URL for JWT-based authentication.
+    /// When set, the server validates `authorization: Bearer` tokens on gRPC
+    /// requests against the issuer's JWKS endpoint.
+    #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// Expected OIDC audience claim (typically the client ID).
+    #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
+    oidc_audience: String,
+
+    /// JWKS key cache TTL in seconds.
+    #[arg(long, env = "OPENSHELL_OIDC_JWKS_TTL", default_value_t = 3600)]
+    oidc_jwks_ttl: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ROLES_CLAIM",
+        default_value = "realm_access.roles"
+    )]
+    oidc_roles_claim: String,
+
+    /// Role name that grants admin access.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ADMIN_ROLE",
+        default_value = "openshell-admin"
+    )]
+    oidc_admin_role: String,
+
+    /// Role name that grants standard user access.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_USER_ROLE",
+        default_value = "openshell-user"
+    )]
+    oidc_user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When set, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
+    #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
+    oidc_scopes_claim: String,
 }
 
 pub fn command() -> Command {
@@ -239,7 +295,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let bind = SocketAddr::from((args.bind_address, args.port));
 
     let tls = if args.disable_tls {
         None
@@ -331,6 +387,18 @@ async fn run_from_args(args: Args) -> Result<()> {
         config = config.with_host_gateway_ip(ip);
     }
 
+    if let Some(issuer) = args.oidc_issuer {
+        config = config.with_oidc(openshell_core::OidcConfig {
+            issuer,
+            audience: args.oidc_audience,
+            jwks_ttl_secs: args.oidc_jwks_ttl,
+            roles_claim: args.oidc_roles_claim,
+            admin_role: args.oidc_admin_role,
+            user_role: args.oidc_user_role,
+            scopes_claim: args.oidc_scopes_claim,
+        });
+    }
+
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,
         driver_dir: args.driver_dir,
@@ -369,7 +437,9 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
 
 #[cfg(test)]
 mod tests {
-    use super::command;
+    use super::{Args, command};
+    use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn command_uses_gateway_binary_name() {
@@ -384,5 +454,25 @@ mod tests {
         let cmd = command();
         let version = cmd.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+
+    #[test]
+    fn command_defaults_bind_address_to_all_interfaces() {
+        let args =
+            Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn command_parses_bind_address() {
+        let args = Args::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--bind-address",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }

@@ -59,6 +59,9 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
+  // Credential keys this policy's binaries are allowed to resolve.
+  // When empty, all credentials are resolvable (backward compatible).
+  repeated string allowed_secrets = 4;
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.
@@ -102,6 +105,47 @@ message NetworkEndpoint {
   // upstreams like GitLab that embed %2F in namespaced resource paths.
   // Defaults to false (strict).
   bool allow_encoded_slash = 11;
+  // Optional credential injection config. When set, the L7 proxy strips
+  // the specified headers from incoming requests and injects
+  // provider-managed credentials before forwarding.
+  CredInjectConfig cred_inject = 12;
+  // When true, the proxy returns post-rewrite headers as JSON instead of
+  // forwarding upstream. For wire proof testing.
+  bool echo = 13;
+  // Optional trust check config. When set, package downloads are evaluated
+  // against deps.dev vulnerability and license data.
+  TrustCheckConfig trust_check = 14;
+}
+
+// Credential injection configuration for a network endpoint.
+// Instructs the L7 proxy to strip caller-supplied credential headers and
+// replace them with provider-managed credentials at request time.
+message CredInjectConfig {
+  // Identifier of the credential provider to use (e.g. "anthropic-prod").
+  string provider = 1;
+  // Headers to strip from the incoming request before forwarding.
+  // Stripping is unconditional — the header is removed even if injection
+  // is unavailable, preventing credential leakage.
+  repeated string strip_headers = 2;
+  // Headers to inject into the forwarded request.
+  repeated CredInjectHeader inject = 3;
+}
+
+// A single header to inject, sourced from a named credential.
+message CredInjectHeader {
+  // HTTP header name to inject (e.g. "x-api-key").
+  string header = 1;
+  // Name of the credential value to use as the header value
+  // (e.g. "ANTHROPIC_API_KEY").
+  string from_credential = 2;
+}
+
+// Trust check configuration for package registry endpoints.
+// When set, the proxy queries deps.dev for vulnerability/license data
+// before allowing package downloads.
+message TrustCheckConfig {
+  // Package registry type: "pypi" or "npm".
+  string registry = 1;
 }
 
 // An L7 deny rule that blocks specific requests.

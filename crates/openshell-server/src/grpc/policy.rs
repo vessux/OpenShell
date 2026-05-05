@@ -10,9 +10,9 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
-use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
+use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -65,7 +65,7 @@ use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit, curr
 const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
-pub(crate) const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 /// Reserved settings key used to store global policy payload.
 const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
@@ -135,10 +135,10 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             rule_name,
             host,
             port,
-        } => match rule_name {
-            Some(rule_name) => format!("remove-endpoint {host}:{port} from rule {rule_name}"),
-            None => format!("remove-endpoint {host}:{port}"),
-        },
+        } => rule_name.as_ref().map_or_else(
+            || format!("remove-endpoint {host}:{port}"),
+            |rule_name| format!("remove-endpoint {host}:{port} from rule {rule_name}"),
+        ),
         PolicyMergeOp::RemoveRule { rule_name } => format!("remove-rule {rule_name}"),
         PolicyMergeOp::AddDenyRules {
             host,
@@ -303,6 +303,36 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn is_sandbox_secret_authenticated<T>(request: &Request<T>) -> bool {
+    oidc::is_sandbox_secret_authenticated(request.metadata())
+}
+
+/// Sandbox-secret-authenticated callers may only perform sandbox-scoped policy
+/// sync. They must not be able to mutate global config or sandbox settings.
+fn validate_sandbox_secret_update(req: &UpdateConfigRequest) -> Result<(), Status> {
+    if req.global {
+        return Err(Status::permission_denied(
+            "sandbox secret cannot mutate global config",
+        ));
+    }
+    if req.delete_setting {
+        return Err(Status::permission_denied(
+            "sandbox secret cannot delete settings",
+        ));
+    }
+    if req.name.trim().is_empty() {
+        return Err(Status::permission_denied(
+            "sandbox secret may only perform sandbox policy sync",
+        ));
+    }
+    if req.policy.is_none() || !req.setting_key.trim().is_empty() {
+        return Err(Status::permission_denied(
+            "sandbox secret may only perform sandbox policy sync",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +514,11 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let sandbox_secret_auth = is_sandbox_secret_authenticated(&request);
     let req = request.into_inner();
+    if sandbox_secret_auth {
+        validate_sandbox_secret_update(&req)?;
+    }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
     let has_setting = !key.is_empty();
@@ -2001,15 +2035,15 @@ fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Stat
 
     for ep in &rule.endpoints {
         // Check if the endpoint host is a literal always-blocked IP.
-        if let Ok(ip) = ep.host.parse::<IpAddr>() {
-            if is_always_blocked_ip(ip) {
-                return Err(Status::invalid_argument(format!(
-                    "proposed rule endpoint host '{}' is an always-blocked address \
-                     (loopback/link-local/unspecified); the proxy will deny traffic \
-                     to this destination regardless of policy",
-                    ep.host
-                )));
-            }
+        if let Ok(ip) = ep.host.parse::<IpAddr>()
+            && is_always_blocked_ip(ip)
+        {
+            return Err(Status::invalid_argument(format!(
+                "proposed rule endpoint host '{}' is an always-blocked address \
+                 (loopback/link-local/unspecified); the proxy will deny traffic \
+                 to this destination regardless of policy",
+                ep.host
+            )));
         }
         let host_lc = ep.host.to_lowercase();
         if host_lc == "localhost" || host_lc == "localhost." {
@@ -2028,14 +2062,14 @@ fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Stat
                     IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
                 })
             });
-            if let Ok(net) = parsed {
-                if is_always_blocked_net(net) {
-                    return Err(Status::invalid_argument(format!(
-                        "proposed rule contains always-blocked allowed_ips entry '{entry}'; \
-                         SSRF hardening prevents traffic to these destinations \
-                         regardless of policy"
-                    )));
-                }
+            if let Ok(net) = parsed
+                && is_always_blocked_net(net)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "proposed rule contains always-blocked `allowed_ips` entry '{entry}'; \
+                     SSRF hardening prevents traffic to these destinations \
+                     regardless of policy"
+                )));
             }
             // Invalid entries are not our concern here — the sandbox's
             // parse_allowed_ips handles syntax validation.
@@ -2591,6 +2625,49 @@ mod tests {
     use std::sync::Arc;
     use tonic::Code;
 
+    #[test]
+    fn sandbox_secret_update_validation_allows_sandbox_policy_sync() {
+        let req = UpdateConfigRequest {
+            name: "sandbox-1".to_string(),
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_secret_update(&req).is_ok());
+    }
+
+    #[test]
+    fn sandbox_secret_update_validation_rejects_global_mutation() {
+        let req = UpdateConfigRequest {
+            global: true,
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        };
+        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_secret_update_validation_rejects_setting_mutation() {
+        let req = UpdateConfigRequest {
+            name: "sandbox-1".to_string(),
+            setting_key: "inference.model".to_string(),
+            setting_value: Some(SettingValue { value: None }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_secret_marker_detected_from_metadata() {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            oidc::INTERNAL_AUTH_SOURCE_HEADER,
+            oidc::AUTH_SOURCE_SANDBOX_SECRET.parse().unwrap(),
+        );
+        assert!(is_sandbox_secret_authenticated(&req));
+    }
+
     // ---- Sandbox without policy ----
 
     #[tokio::test]
@@ -2603,7 +2680,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-no-policy".to_string(),
                 name: "no-policy-sandbox".to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             spec: Some(SandboxSpec {
@@ -2633,7 +2710,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-backfill".to_string(),
                 name: "backfill-sandbox".to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             spec: Some(SandboxSpec {
@@ -2700,6 +2777,7 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
         ))
     }
 
@@ -3184,7 +3262,7 @@ mod tests {
         let sandbox_id = "sb-merge";
 
         let initial_policy = SandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 "test_server".to_string(),
                 NetworkPolicyRule {
                     name: "test_server".to_string(),
@@ -3198,8 +3276,7 @@ mod tests {
                         ..Default::default()
                     }],
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };
@@ -3284,7 +3361,7 @@ mod tests {
         let sandbox_id = "sb-new";
 
         let initial_policy = SandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 "existing_rule".to_string(),
                 NetworkPolicyRule {
                     name: "existing_rule".to_string(),
@@ -3298,8 +3375,7 @@ mod tests {
                         ..Default::default()
                     }],
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };
@@ -3370,7 +3446,7 @@ mod tests {
         let sandbox_id = "sb-concurrent-merge";
 
         let initial_policy = SandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 "github".to_string(),
                 NetworkPolicyRule {
                     name: "github".to_string(),
@@ -3384,8 +3460,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };
@@ -3601,8 +3676,7 @@ mod tests {
         let encoded = hex::encode(policy.encode_to_vec());
         let global = StoredSettings {
             revision: 1,
-            settings: [("policy".to_string(), StoredSettingValue::Bytes(encoded))]
-                .into_iter()
+            settings: std::iter::once(("policy".to_string(), StoredSettingValue::Bytes(encoded)))
                 .collect(),
         };
 
@@ -3751,20 +3825,18 @@ mod tests {
     fn merge_effective_settings_policy_key_is_excluded() {
         let global = StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 "policy".to_string(),
                 StoredSettingValue::Bytes("deadbeef".to_string()),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         let sandbox = StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 "policy".to_string(),
                 StoredSettingValue::Bytes("cafebabe".to_string()),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
 

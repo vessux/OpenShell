@@ -6,9 +6,10 @@
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, OpaEngine};
+use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
+use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
@@ -19,11 +20,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{
+    AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -42,6 +45,8 @@ const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
     action: NetworkAction,
+    /// Policy generation used for the L4 network decision.
+    generation: u64,
     /// Resolved binary path.
     binary: Option<PathBuf>,
     /// PID owning the socket.
@@ -79,6 +84,9 @@ pub struct InferenceContext {
 }
 
 impl InferenceContext {
+    // `router`/`routes` are intentionally distinct nouns (the router and the
+    // route list it consumes); both names are clearer than alternatives.
+    #[allow(clippy::similar_names)]
     pub fn new(
         patterns: Vec<crate::l7::inference::InferenceApiPattern>,
         router: openshell_router::Router,
@@ -148,8 +156,9 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
-        secret_resolver: Option<Arc<SecretResolver>>,
+        secret_resolver: Arc<ArcSwapOption<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        trust_cache: Arc<crate::trust::TrustCache>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -187,11 +196,12 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver = secret_resolver.clone();
+                        let resolver: Option<Arc<SecretResolver>> = secret_resolver.load_full();
                         let dtx = denial_tx.clone();
+                        let tc = trust_cache.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, tc,
                             )
                             .await
                             {
@@ -295,6 +305,10 @@ fn emit_denial_simple(
     }
 }
 
+// Many distinct, non-related context parameters are required for a CONNECT
+// dispatch; bundling them into a struct would just shift the noise into call
+// sites.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
@@ -304,6 +318,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -348,6 +363,7 @@ async fn handle_tcp_connection(
             entrypoint_pid,
             secret_resolver,
             denial_tx.as_ref(),
+            trust_cache,
         )
         .await;
     }
@@ -485,6 +501,121 @@ async fn handle_tcp_connection(
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
+    // Query L7 config early so we can detect echo mode before DNS resolution.
+    let echo_l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
+    let is_echo = echo_l7_route
+        .as_ref()
+        .and_then(|route| route.config.as_ref())
+        .is_some_and(|c| c.config.echo);
+
+    if is_echo {
+        // Echo mode: skip DNS resolution and upstream connect entirely.
+        info!(
+            host = %host_lc,
+            port = port,
+            "ECHO mode active — skipping DNS/upstream, will return headers as JSON"
+        );
+
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+        {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "opa")
+                .message(format!("CONNECT_ECHO allowed {host_lc}:{port}"))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            policy_name: matched_policy.clone().unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            secret_resolver: filter_resolver_by_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+                &secret_resolver,
+            ),
+            cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+            echo: true,
+            trust_cache: Some(trust_cache.clone()),
+            trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
+        };
+
+        // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
+        let (mut dummy_upstream, _dummy_rx) = tokio::io::duplex(1);
+
+        if let Some(l7_config) = echo_l7_route.as_ref().and_then(|route| route.config.as_ref()) {
+            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                    return Ok(());
+                }
+            };
+
+            // Peek to detect TLS vs plaintext (same logic as normal path).
+            let mut peek_buf = [0u8; 8];
+            let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            if crate::l7::tls::looks_like_tls(&peek_buf[..n]) {
+                if let Some(ref tls) = tls_state {
+                    let mut tls_client =
+                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                    let _ = crate::l7::relay::relay_with_inspection(
+                        &l7_config.config,
+                        tunnel_engine,
+                        &mut tls_client,
+                        &mut dummy_upstream,
+                        &ctx,
+                    )
+                    .await;
+                }
+            } else {
+                let _ = crate::l7::relay::relay_with_inspection(
+                    &l7_config.config,
+                    tunnel_engine,
+                    &mut client,
+                    &mut dummy_upstream,
+                    &ctx,
+                )
+                .await;
+            }
+        }
+
+        return Ok(());
+    }
+
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
@@ -497,6 +628,9 @@ async fn handle_tcp_connection(
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
+    // The "non-empty" branch is the explicit-allowlist path; reading it first
+    // matches the policy decision narrative.
+    #[allow(clippy::if_not_else)]
     let mut upstream = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
@@ -658,12 +792,16 @@ async fn handle_tcp_connection(
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    // Check if endpoint has L7 config for protocol-aware inspection
-    let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
+    // Check if endpoint has L7 config for protocol-aware inspection, and
+    // retain the generation for HTTP passthrough keep-alive tunnels.
+    let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    let connect_msg = if l7_config.is_some() {
+    let connect_msg = if l7_route
+        .as_ref()
+        .is_some_and(|route| route.config.is_some())
+    {
         "CONNECT_L7"
     } else {
         "CONNECT"
@@ -712,7 +850,17 @@ async fn handle_tcp_connection(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
-        secret_resolver: secret_resolver.clone(),
+        secret_resolver: filter_resolver_by_policy(
+            &opa_engine,
+            &decision,
+            &host_lc,
+            port,
+            &secret_resolver,
+        ),
+        cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+        echo: l7_route.as_ref().and_then(|r| r.config.as_ref()).is_some_and(|c| c.config.echo),
+        trust_cache: Some(trust_cache.clone()),
+        trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
     };
 
     if effective_tls_skip {
@@ -748,24 +896,19 @@ async fn handle_tcp_connection(
                     crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
                         .await?;
 
-                if let Some(ref l7_config) = l7_config {
+                if let Some(l7_config) = l7_route.as_ref().and_then(|route| route.config.as_ref()) {
                     // L7 inspection on terminated TLS traffic.
-                    let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!(
-                                "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
-                            ))
-                            .build();
-                        ocsf_emit!(event);
-                        regorus::Engine::new()
-                    });
+                    let tunnel_engine =
+                        match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+                            Ok(engine) => engine,
+                            Err(e) => {
+                                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                                return Ok(());
+                            }
+                        };
                     crate::l7::relay::relay_with_inspection(
-                        l7_config,
-                        std::sync::Mutex::new(tunnel_engine),
+                        &l7_config.config,
+                        tunnel_engine,
                         &mut tls_client,
                         &mut tls_upstream,
                         &ctx,
@@ -773,10 +916,21 @@ async fn handle_tcp_connection(
                     .await
                 } else {
                     // No L7 config — relay with credential injection only.
+                    let generation = l7_route
+                        .as_ref()
+                        .map_or(decision.generation, |route| route.generation);
+                    let generation_guard = match opa_engine.generation_guard(generation) {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                            return Ok(());
+                        }
+                    };
                     crate::l7::relay::relay_passthrough_with_credentials(
                         &mut tls_client,
                         &mut tls_upstream,
                         &ctx,
+                        &generation_guard,
                     )
                     .await
                 }
@@ -819,23 +973,17 @@ async fn handle_tcp_connection(
         }
     } else if is_http {
         // Plaintext HTTP detected.
-        if let Some(ref l7_config) = l7_config {
-            let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                    .activity(ActivityId::Fail)
-                    .severity(SeverityId::Low)
-                    .status(StatusId::Failure)
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .message(format!(
-                        "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
-                    ))
-                    .build();
-                ocsf_emit!(event);
-                regorus::Engine::new()
-            });
+        if let Some(l7_config) = l7_route.as_ref().and_then(|route| route.config.as_ref()) {
+            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                    return Ok(());
+                }
+            };
             if let Err(e) = crate::l7::relay::relay_with_inspection(
-                l7_config,
-                std::sync::Mutex::new(tunnel_engine),
+                &l7_config.config,
+                tunnel_engine,
                 &mut client,
                 &mut upstream,
                 &ctx,
@@ -857,10 +1005,21 @@ async fn handle_tcp_connection(
             }
         } else {
             // Plaintext HTTP, no L7 config — relay with credential injection.
+            let generation = l7_route
+                .as_ref()
+                .map_or(decision.generation, |route| route.generation);
+            let generation_guard = match opa_engine.generation_guard(generation) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                    return Ok(());
+                }
+            };
             if let Err(e) = crate::l7::relay::relay_passthrough_with_credentials(
                 &mut client,
                 &mut upstream,
                 &ctx,
+                &generation_guard,
             )
             .await
             {
@@ -1093,6 +1252,7 @@ fn evaluate_opa_tcp(
      -> ConnectDecision {
         ConnectDecision {
             action: NetworkAction::Deny { reason },
+            generation: engine.current_generation(),
             binary,
             binary_pid,
             ancestors,
@@ -1144,9 +1304,10 @@ fn evaluate_opa_tcp(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    let result = match engine.evaluate_network_action(&input) {
-        Ok(action) => ConnectDecision {
+    let result = match engine.evaluate_network_action_with_generation(&input) {
+        Ok((action, generation)) => ConnectDecision {
             action,
+            generation,
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
             ancestors,
@@ -1181,6 +1342,7 @@ fn evaluate_opa_tcp(
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
         },
+        generation: _engine.current_generation(),
         binary: None,
         binary_pid: None,
         ancestors: vec![],
@@ -1584,16 +1746,95 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct L7ConfigSnapshot {
+    config: crate::l7::L7EndpointConfig,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct L7RouteSnapshot {
+    config: Option<L7ConfigSnapshot>,
+    generation: u64,
+}
+
+fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "L7 tunnel closed before inspection because policy changed: {error}"
+        ))
+        .build();
+    ocsf_emit!(event);
+}
+
 /// Query L7 endpoint config from the OPA engine for a matched CONNECT decision.
 ///
 /// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
 /// `None` for L4-only endpoints.
-fn query_l7_config(
+fn query_l7_route_snapshot(
     engine: &OpaEngine,
     decision: &ConnectDecision,
     host: &str,
     port: u16,
-) -> Option<crate::l7::L7EndpointConfig> {
+) -> Option<L7RouteSnapshot> {
+    // Only query if action is Allow (not Deny)
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config_with_generation(&input) {
+        Ok((Some(val), generation)) => Some(L7RouteSnapshot {
+            config: crate::l7::parse_l7_config(&val)
+                .map(|config| L7ConfigSnapshot { config, generation }),
+            generation,
+        }),
+        Ok((None, generation)) => Some(L7RouteSnapshot {
+            config: None,
+            generation,
+        }),
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query L7 endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+/// Query cred_inject config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(CredInjectConfig)` if the matched endpoint has cred_inject config,
+/// `None` otherwise.
+fn query_cred_inject_config(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::CredInjectConfig> {
     // Only query if action is Allow (not Deny)
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
@@ -1613,7 +1854,7 @@ fn query_l7_config(
     };
 
     match engine.query_endpoint_config(&input) {
-        Ok(Some(val)) => crate::l7::parse_l7_config(&val),
+        Ok(Some(val)) => crate::l7::parse_cred_inject_config(&val),
         Ok(None) => None,
         Err(e) => {
             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
@@ -1621,10 +1862,103 @@ fn query_l7_config(
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!("Failed to query L7 endpoint config: {e}"))
+                .message(format!("Failed to query cred_inject endpoint config: {e}"))
                 .build();
             ocsf_emit!(event);
             None
+        }
+    }
+}
+
+/// Query trust_check config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(TrustCheckConfig)` if the matched endpoint has trust_check config,
+/// `None` otherwise.
+fn query_trust_check_config(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::TrustCheckConfig> {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_trust_check_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query trust_check endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+/// Query OPA for `allowed_secrets` and return a filtered `SecretResolver`.
+///
+/// If the matched policy has no `allowed_secrets` constraint (or the list is
+/// empty), the full resolver is returned unchanged so the behaviour is
+/// backward-compatible.  On OPA error the full resolver is also returned and
+/// the failure is emitted as an OCSF event.
+fn filter_resolver_by_policy(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+    resolver: &Option<Arc<SecretResolver>>,
+) -> Option<Arc<SecretResolver>> {
+    let resolver = resolver.as_ref()?;
+
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return Some(Arc::clone(resolver));
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_allowed_secrets(&input) {
+        Ok(allowed) if !allowed.is_empty() => Some(Arc::new(resolver.filtered(&allowed))),
+        Ok(_) => Some(Arc::clone(resolver)),
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query allowed_secrets: {e}"))
+                .build();
+            ocsf_emit!(event);
+            Some(Arc::clone(resolver))
         }
     }
 }
@@ -1640,7 +1974,7 @@ fn query_tls_mode(
 ) -> crate::l7::TlsMode {
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        _ => false,
+        NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
         return crate::l7::TlsMode::Auto;
@@ -1763,7 +2097,10 @@ async fn resolve_from_sandbox_hosts(
     if addrs.is_empty() { None } else { Some(addrs) }
 }
 
+// Mirrors the Linux signature so call sites can `.await` uniformly across
+// platforms; the non-Linux path has nothing to await.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
 async fn resolve_from_sandbox_hosts(
     _host: &str,
     _port: u16,
@@ -1969,7 +2306,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
                 nets.push(n);
             }
-            Err(_) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
+            Err(()) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
 
@@ -1980,7 +2317,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     }
 }
 
-/// Query allowed_ips from the matched endpoint config for a CONNECT decision.
+/// Query `allowed_ips` from the matched endpoint config for a CONNECT decision.
 fn query_allowed_ips(
     engine: &OpaEngine,
     decision: &ConnectDecision,
@@ -1990,7 +2327,7 @@ fn query_allowed_ips(
     // Only query if action is Allow with a matched policy
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        _ => false,
+        NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
         return vec![];
@@ -2049,15 +2386,12 @@ fn normalize_inference_path(path: &str) -> String {
 fn extract_host_from_uri(uri: &str) -> String {
     // Absolute-form URIs look like "http://host[:port]/path"
     // Strip the scheme prefix, then extract the authority (host[:port]) before the first '/'.
-    let after_scheme = uri.find("://").map(|i| &uri[i + 3..]).unwrap_or(uri);
+    let after_scheme = uri.find("://").map_or(uri, |i| &uri[i + 3..]);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     // Strip port if present (handle IPv6 bracket notation)
     let host = if authority.starts_with('[') {
         // IPv6: [::1]:port
-        authority
-            .find(']')
-            .map(|i| &authority[..=i])
-            .unwrap_or(authority)
+        authority.find(']').map_or(authority, |i| &authority[..=i])
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
@@ -2092,14 +2426,12 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
             .find(']')
             .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket in URI: {uri}"))?;
         let after_bracket = &rest[bracket_end + 1..];
-        if let Some(slash_pos) = after_bracket.find('/') {
+        after_bracket.find('/').map_or((rest, "/"), |slash_pos| {
             (
-                &rest[..bracket_end + 1 + slash_pos],
+                &rest[..=bracket_end + slash_pos],
                 &after_bracket[slash_pos..],
             )
-        } else {
-            (&rest[..], "/")
-        }
+        })
     } else if let Some(slash_pos) = rest.find('/') {
         (&rest[..slash_pos], &rest[slash_pos..])
     } else {
@@ -2210,10 +2542,10 @@ fn rewrite_forward_request(
             continue;
         }
 
-        let rewritten_line = match secret_resolver {
-            Some(resolver) => rewrite_header_line(line, resolver),
-            None => line.to_string(),
-        };
+        let rewritten_line = secret_resolver.map_or_else(
+            || line.to_string(),
+            |resolver| rewrite_header_line(line, resolver),
+        );
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -2250,12 +2582,53 @@ fn rewrite_forward_request(
     Ok(output)
 }
 
+async fn relay_rewritten_forward_request<C, U>(
+    method: &str,
+    path: &str,
+    rewritten: Vec<u8>,
+    client: &mut C,
+    upstream: &mut U,
+    generation_guard: &PolicyGenerationGuard,
+) -> Result<crate::l7::provider::RelayOutcome>
+where
+    C: TokioAsyncRead + TokioAsyncWrite + Unpin,
+    U: TokioAsyncRead + TokioAsyncWrite + Unpin,
+{
+    let header_end = rewritten
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(rewritten.len(), |p| p + 4);
+    let header_str = String::from_utf8_lossy(&rewritten[..header_end]);
+    let body_length = crate::l7::rest::parse_body_length(&header_str)?;
+    let (_, query_params) = crate::l7::rest::parse_target_query(path)?;
+    let req = crate::l7::provider::L7Request {
+        action: method.to_string(),
+        target: path.to_string(),
+        query_params,
+        raw_header: rewritten,
+        body_length,
+    };
+
+    crate::l7::rest::relay_http_request_with_resolver_guarded(
+        &req,
+        client,
+        upstream,
+        None,
+        Some(generation_guard),
+        None,
+    )
+    .await
+}
+
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
 ///
 /// Public IPs are allowed through when the endpoint passes OPA evaluation.
 /// Private IPs require explicit `allowed_ips` on the endpoint config (SSRF
 /// override). Rewrites the absolute-form request to origin-form, connects
-/// upstream, and relays the response using `copy_bidirectional` for streaming.
+/// upstream, and relays the request/response using the guarded HTTP relay.
+// Many distinct, non-related context parameters are required for forward proxy
+// dispatch; bundling them into a struct would just shift the noise into call sites.
+#[allow(clippy::too_many_arguments)]
 async fn handle_forward_proxy(
     method: &str,
     target_uri: &str,
@@ -2267,6 +2640,7 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -2412,23 +2786,69 @@ async fn handle_forward_proxy(
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
+        Ok(guard) => guard,
+        Err(e) => {
+            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
     //     connection (Connection: close), so a single evaluation suffices.
-    if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
-        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .message(format!("Failed to clone OPA engine for forward L7: {e}"))
-                .build();
-            ocsf_emit!(event);
-            regorus::Engine::new()
-        });
-        let engine_mutex = std::sync::Mutex::new(tunnel_engine);
+    if let Some(route) = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port)
+        && let Some(l7_config) = route.config
+    {
+        if l7_config.generation != forward_generation_guard.captured_generation() {
+            emit_l7_tunnel_close_after_policy_change(
+                &host_lc,
+                port,
+                miette::miette!(
+                    "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
+                    forward_generation_guard.captured_generation(),
+                    l7_config.generation,
+                ),
+            );
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+            Ok(engine) => engine,
+            Err(e) => {
+                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "policy_denied",
+                        &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         let l7_ctx = crate::l7::relay::L7EvalContext {
             host: host_lc.clone(),
@@ -2449,7 +2869,17 @@ async fn handle_forward_proxy(
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            secret_resolver: secret_resolver.clone(),
+            secret_resolver: filter_resolver_by_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+                &secret_resolver,
+            ),
+            cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+            echo: l7_config.config.echo,
+            trust_cache: Some(trust_cache.clone()),
+            trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA
@@ -2460,16 +2890,17 @@ async fn handle_forward_proxy(
         // while the upstream re-normalizes the raw input and dispatches on a
         // potentially different path.
         let canonicalize_options = crate::l7::path::CanonicalizeOptions {
-            allow_encoded_slash: l7_config.allow_encoded_slash,
+            allow_encoded_slash: l7_config.config.allow_encoded_slash,
             ..Default::default()
         };
         let query_params =
             match crate::l7::path::canonicalize_request_target(&path, &canonicalize_options) {
                 Ok((canon, query)) => {
-                    let params = match query.as_deref() {
-                        Some(q) => crate::l7::rest::parse_query_params(q).unwrap_or_default(),
-                        None => std::collections::HashMap::new(),
-                    };
+                    let params = query
+                        .as_deref()
+                        .map_or_else(std::collections::HashMap::new, |q| {
+                            crate::l7::rest::parse_query_params(q).unwrap_or_default()
+                        });
                     path = canon.path;
                     params
                 }
@@ -2504,7 +2935,7 @@ async fn handle_forward_proxy(
         };
 
         let (allowed, reason) =
-            crate::l7::relay::evaluate_l7_request(&engine_mutex, &l7_ctx, &request_info)
+            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info, None)
                 .unwrap_or_else(|e| {
                     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Fail)
@@ -2517,7 +2948,7 @@ async fn handle_forward_proxy(
                     (false, format!("L7 evaluation error: {e}"))
                 });
 
-        let decision_str = match (allowed, l7_config.enforcement) {
+        let decision_str = match (allowed, l7_config.config.enforcement) {
             (true, _) => "allow",
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
@@ -2525,13 +2956,8 @@ async fn handle_forward_proxy(
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
-                "allow" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "audit" => (
+                "allow" | "audit" => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,
@@ -2566,7 +2992,7 @@ async fn handle_forward_proxy(
         }
 
         let effectively_denied =
-            !allowed && l7_config.enforcement == crate::l7::EnforcementMode::Enforce;
+            !allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce;
 
         if effectively_denied {
             emit_denial_simple(
@@ -2603,6 +3029,9 @@ async fn handle_forward_proxy(
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
 
+    // The "non-empty" branch is the explicit-allowlist path; reading it first
+    // matches the policy decision narrative.
+    #[allow(clippy::if_not_else)]
     let addrs =
         if !raw_allowed_ips.is_empty() {
             // allowed_ips mode: validate resolved IPs against CIDR allowlist.
@@ -2765,6 +3194,21 @@ async fn handle_forward_proxy(
             }
         };
 
+    if let Err(e) = forward_generation_guard.ensure_current() {
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
     // 6. Connect upstream
     let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
         Ok(s) => s,
@@ -2849,12 +3293,32 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
-    upstream.write_all(&rewritten).await.into_diagnostic()?;
-
-    // 8. Relay remaining traffic bidirectionally (supports streaming)
-    let _ = tokio::io::copy_bidirectional(client, &mut upstream)
-        .await
-        .into_diagnostic()?;
+    if let Err(e) = forward_generation_guard.ensure_current() {
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let outcome = relay_rewritten_forward_request(
+        method,
+        &path,
+        rewritten,
+        client,
+        &mut upstream,
+        &forward_generation_guard,
+    )
+    .await?;
+    if let crate::l7::provider::RelayOutcome::Upgraded { overflow } = outcome {
+        crate::l7::relay::handle_upgrade(client, &mut upstream, overflow, &host_lc, port).await?;
+    }
 
     Ok(())
 }
@@ -2916,6 +3380,12 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::needless_continue,
+    reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
+)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -3927,6 +4397,80 @@ mod tests {
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 
+    #[tokio::test]
+    async fn test_forward_relay_guard_blocks_stale_generation_before_upstream_write() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(policy, policy_data).unwrap();
+
+        let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
+        let rewritten =
+            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_rewritten_forward_request(
+            "GET",
+            "/api",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            &guard,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale generation must stop forward relay before upstream write"
+        );
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "stale forward request bytes must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_relay_rejects_cl_te_smuggling_before_upstream_write() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+
+        let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let rewritten =
+            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_rewritten_forward_request(
+            "POST",
+            "/api",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            &guard,
+        )
+        .await;
+        assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "smuggled forward request bytes must not reach upstream"
+        );
+    }
+
     // --- Forward proxy SSRF defence tests ---
     //
     // The forward proxy handler uses the same SSRF logic as the CONNECT path:
@@ -4378,6 +4922,8 @@ mod tests {
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             assert!(flags >= 0, "F_GETFD failed");
@@ -4391,9 +4937,13 @@ mod tests {
         let sleep_path = CString::new("/bin/sleep").unwrap();
         let arg0 = CString::new("sleep").unwrap();
         let arg1 = CString::new("30").unwrap();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork failed");
         if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             unsafe {
                 libc::execl(
                     sleep_path.as_ptr(),
@@ -4420,8 +4970,27 @@ mod tests {
         }
 
         let cache = BinaryIdentityCache::new();
-        let result = resolve_process_identity(std::process::id(), peer_port, &cache);
 
+        // Resolve with a brief retry loop — under heavy CI load the child's
+        // procfs entry can momentarily fail to resolve even though the loop
+        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
+        // few times before declaring failure so the test is not flaky.
+        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
+        for _ in 0..5 {
+            match &result {
+                Err(err)
+                    if err.reason.contains("No such file or directory")
+                        || err.reason.contains("os error 2") =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                }
+                _ => break,
+            }
+        }
+
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);

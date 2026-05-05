@@ -52,23 +52,21 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
+        supports_gpu: false,
     }
 }
 
 #[test]
-fn container_visible_endpoint_rewrites_loopback_hosts() {
-    assert_eq!(
-        container_visible_openshell_endpoint("https://localhost:8443"),
-        "https://host.openshell.internal:8443/"
-    );
-    assert_eq!(
-        container_visible_openshell_endpoint("http://127.0.0.1:8080"),
-        "http://host.openshell.internal:8080/"
-    );
-    assert_eq!(
-        container_visible_openshell_endpoint("https://gateway.internal:8443"),
-        "https://gateway.internal:8443"
-    );
+fn build_environment_preserves_loopback_endpoint_for_host_network() {
+    let mut config = runtime_config();
+    config.grpc_endpoint = "http://127.0.0.1:8080".to_string();
+
+    let env = build_environment(&test_sandbox(), &config);
+    assert!(env.contains(&"OPENSHELL_ENDPOINT=http://127.0.0.1:8080".to_string()));
+
+    config.grpc_endpoint = "https://localhost:8443".to_string();
+    let env = build_environment(&test_sandbox(), &config);
+    assert!(env.contains(&"OPENSHELL_ENDPOINT=https://localhost:8443".to_string()));
 }
 
 #[test]
@@ -170,6 +168,48 @@ fn build_container_create_body_clears_inherited_cmd() {
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|host_config| host_config.device_requests.as_ref())
+            .is_none(),
+        "non-GPU containers should not request Docker devices"
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn build_container_create_body_maps_gpu_to_all_cdi_device() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec![CDI_GPU_DEVICE_ALL.to_string()]
+    );
 }
 
 #[test]
@@ -186,6 +226,23 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
     require_sandbox_identifier("sbx-1", "").expect("id-only is accepted");
     require_sandbox_identifier("", "demo").expect("name-only is accepted");
     require_sandbox_identifier("sbx-1", "demo").expect("id and name is accepted");
+}
+
+#[test]
+fn build_container_create_body_uses_host_network() {
+    let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let host_config = create_body.host_config.expect("host_config is populated");
+
+    assert_eq!(
+        host_config.network_mode,
+        Some("host".to_string()),
+        "sandbox must use host networking so 127.0.0.1 reaches the host gateway"
+    );
+    assert_eq!(
+        host_config.extra_hosts,
+        Some(vec!["host.openshell.internal:127.0.0.1".to_string()]),
+        "sandbox should expose a stable host alias without host /etc/hosts edits"
+    );
 }
 
 #[test]

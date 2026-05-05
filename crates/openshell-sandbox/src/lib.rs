@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Sandbox library.
+//! `OpenShell` Sandbox library.
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
@@ -22,16 +22,20 @@ mod sandbox;
 mod secrets;
 mod ssh;
 mod supervisor_session;
+pub(crate) mod trust;
 
+use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -67,16 +71,15 @@ static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
 
 /// Fallback context used when `OCSF_CTX` has not been initialized (e.g. in
 /// unit tests that exercise individual functions without calling `run_sandbox`).
-static OCSF_CTX_FALLBACK: std::sync::LazyLock<SandboxContext> =
-    std::sync::LazyLock::new(|| SandboxContext {
-        sandbox_id: String::new(),
-        sandbox_name: String::new(),
-        container_image: String::new(),
-        hostname: "test".to_string(),
-        product_version: openshell_core::VERSION.to_string(),
-        proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-        proxy_port: 3128,
-    });
+static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
+    sandbox_id: String::new(),
+    sandbox_name: String::new(),
+    container_image: String::new(),
+    hostname: "test".to_string(),
+    product_version: openshell_core::VERSION.to_string(),
+    proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+    proxy_port: 3128,
+});
 
 /// Return a reference to the process-wide [`SandboxContext`].
 ///
@@ -133,27 +136,27 @@ fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
 }
 
 fn route_refresh_interval_secs() -> u64 {
-    match std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(interval) if interval > 0 => interval,
-            Ok(_) => {
-                warn!(
-                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                    "Ignoring zero route refresh interval"
-                );
-                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-            }
-            Err(error) => {
-                warn!(
-                    interval = %value,
-                    error = %error,
-                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                    "Ignoring invalid route refresh interval"
-                );
-                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-            }
-        },
-        Err(_) => DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+    let Ok(value) = std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") else {
+        return DEFAULT_ROUTE_REFRESH_INTERVAL_SECS;
+    };
+    match value.parse::<u64>() {
+        Ok(interval) if interval > 0 => interval,
+        Ok(_) => {
+            warn!(
+                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                "Ignoring zero route refresh interval"
+            );
+            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+        }
+        Err(error) => {
+            warn!(
+                interval = %value,
+                error = %error,
+                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                "Ignoring invalid route refresh interval"
+            );
+            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+        }
     }
 }
 
@@ -227,9 +230,10 @@ pub async fn run_sandbox(
     // Proxy IP/port use defaults here; they are only significant for network
     // events which happen after the netns is created.
     {
-        let hostname = std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "openshell-sandbox".to_string());
+        let hostname = std::fs::read_to_string("/etc/hostname").map_or_else(
+            |_| "openshell-sandbox".to_string(),
+            |s| s.trim().to_string(),
+        );
 
         if OCSF_CTX
             .set(SandboxContext {
@@ -302,7 +306,11 @@ pub async fn run_sandbox(
     };
 
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
-    let secret_resolver = secret_resolver.map(Arc::new);
+    let secret_resolver = Arc::new(ArcSwapOption::from(secret_resolver.map(Arc::new)));
+
+    let trust_cache = Arc::new(crate::trust::TrustCache::new(
+        std::time::Duration::from_secs(3600),
+    ));
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -480,6 +488,7 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            trust_cache.clone(),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)
@@ -491,15 +500,13 @@ pub async fn run_sandbox(
     // Reads /dev/kmsg for iptables LOG entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let _bypass_monitor = if netns.is_some() {
+    let _bypass_monitor = netns.as_ref().and_then(|ns| {
         bypass_monitor::spawn(
-            netns.as_ref().expect("netns is Some").name().to_string(),
+            ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
         )
-    } else {
-        None
-    };
+    });
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
@@ -596,11 +603,11 @@ pub async fn run_sandbox(
                 }
 
                 match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {}
+                    Ok(WaitStatus::StillAlive)
+                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
                     Ok(reaped) => {
                         tracing::debug!(?reaped, "Reaped orphaned child process");
                     }
-                    Err(nix::errno::Errno::EINTR) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "waitpid error during orphan reap");
                         break;
@@ -823,6 +830,37 @@ pub async fn run_sandbox(
             }
         });
 
+        // Spawn background provider poll task to refresh credentials at runtime.
+        {
+            let poll_id = id.clone();
+            let poll_endpoint = endpoint.clone();
+            let poll_resolver = secret_resolver.clone();
+            let poll_interval_secs: u64 = std::env::var("OPENSHELL_PROVIDER_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+
+            tokio::spawn(async move {
+                if let Err(e) = run_provider_poll_loop(
+                    &poll_endpoint,
+                    &poll_id,
+                    &poll_resolver,
+                    poll_interval_secs,
+                )
+                .await
+                {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .message(format!("Provider poll loop exited with error: {e}"))
+                            .build()
+                    );
+                }
+            });
+        }
+
         // Spawn denial aggregator (gRPC mode only, when proxy is active).
         if let Some(rx) = denial_rx {
             // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
@@ -903,6 +941,9 @@ pub async fn run_sandbox(
 /// wins and the cluster bundle is not fetched.
 ///
 /// Returns `None` if neither source is configured (inference routing disabled).
+// `routes`/`router` are intentionally distinct nouns (the route list vs the
+// router that consumes them); both names are clearer than alternatives.
+#[allow(clippy::similar_names)]
 async fn build_inference_context(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
@@ -1234,14 +1275,31 @@ const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 /// socket at init time.  If the directory exists but Landlock denies traversal
 /// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
 /// even though the daemon is optional.  Only read/traversal access is needed.
-const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced"];
+///
+/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
+/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
+/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
+/// not be covered by the parent-directory Landlock rule when the mount crosses
+/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
+/// is permitted regardless of Landlock's cross-mount behaviour.
+const GPU_BASELINE_READ_ONLY: &[&str] = &[
+    "/run/nvidia-persistenced",
+    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
+];
 
 /// GPU read-write paths (static).
 ///
 /// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
-/// Landlock restricts `open(2)` on device files even when DAC allows it;
-/// these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
+/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
+/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// These devices do not exist on WSL2 and will be skipped by the existence
+/// check in `enrich_proto_baseline_paths()`.
+///
+/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
+/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
+/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
+/// and will be skipped there by the existence check.
 ///
 /// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
 /// to set thread names.  Without write access, `cuInit()` returns error 304.
@@ -1255,12 +1313,17 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
+    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
     "/proc",
 ];
 
 /// Returns true if GPU devices are present in the container.
+///
+/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
+/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
+/// depending on the host kernel; the other will not exist.
 fn has_gpu_devices() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists()
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
 }
 
 /// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
@@ -1429,6 +1492,14 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::similar_names,
+    clippy::manual_string_new,
+    clippy::doc_markdown,
+    reason = "Test code: test fixtures often use idiomatic forms not flagged in production."
+)]
 mod baseline_tests {
     use super::*;
     use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
@@ -1532,6 +1603,17 @@ mod baseline_tests {
     }
 
     #[test]
+    fn gpu_baseline_read_write_contains_dxg() {
+        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
+        // read-write rule for the CDI-injected DXG device.  The existence
+        // check in enrich_proto_baseline_paths() skips it on native Linux.
+        assert!(
+            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
+            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
     fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = SandboxPolicy {
             version: 1,
@@ -1565,6 +1647,29 @@ mod baseline_tests {
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
+
+    #[test]
+    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
+        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
+        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
+        assert!(
+            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
+            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
+        );
+    }
+
+    #[test]
+    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
+        // Verify the OR logic: result must match the manual disjunction of
+        // the two path checks.  Passes in all environments.
+        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
+        let dxg = std::path::Path::new("/dev/dxg").exists();
+        assert_eq!(
+            has_gpu_devices(),
+            nvidiactl || dxg,
+            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
+        );
+    }
 }
 
 /// Returns `true` if the error is transient and worth retrying.
@@ -1596,10 +1701,10 @@ fn is_retryable_error(err: &miette::Report) -> bool {
 ///
 /// Non-transient gRPC errors (e.g. `NOT_FOUND`, `INVALID_ARGUMENT`,
 /// `PERMISSION_DENIED`) are returned immediately without retrying.
-async fn grpc_retry<T, F, Fut>(op_name: &str, f: F) -> miette::Result<T>
+async fn grpc_retry<T, F, Fut>(op_name: &str, f: F) -> Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = miette::Result<T>>,
+    Fut: Future<Output = Result<T>>,
 {
     let mut last_err = None;
     for attempt in 1..=5u32 {
@@ -1692,55 +1797,51 @@ async fn load_policy(
         let proto_policy =
             grpc_retry("Policy fetch", || grpc_client::fetch_policy(endpoint, id)).await?;
 
-        let mut proto_policy = match proto_policy {
-            Some(p) => p,
-            None => {
-                // No policy configured on the server. Discover from disk or
-                // fall back to the restrictive default, then sync to the
-                // gateway so it becomes the authoritative baseline.
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Other, "discovery")
-                        .message("Server returned no policy; attempting local discovery")
-                        .build()
-                );
-                let mut discovered = discover_policy_from_disk_or_default();
-                // Enrich before syncing so the gateway baseline includes
-                // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
-                let sandbox = sandbox.as_deref().ok_or_else(|| {
-                    miette::miette!(
-                        "Cannot sync discovered policy: sandbox not available.\n\
-                         Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
-                    )
-                })?;
+        let mut proto_policy = if let Some(p) = proto_policy {
+            p
+        } else {
+            // No policy configured on the server. Discover from disk or
+            // fall back to the restrictive default, then sync to the
+            // gateway so it becomes the authoritative baseline.
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Other, "discovery")
+                    .message("Server returned no policy; attempting local discovery")
+                    .build()
+            );
+            let mut discovered = discover_policy_from_disk_or_default();
+            // Enrich before syncing so the gateway baseline includes
+            // baseline paths from the start.
+            enrich_proto_baseline_paths(&mut discovered);
+            let sandbox = sandbox.as_deref().ok_or_else(|| {
+                miette::miette!(
+                    "Cannot sync discovered policy: sandbox not available.\n\
+                     Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
+                )
+            })?;
 
-                // Sync and re-fetch over a single connection to avoid extra
-                // TLS handshakes.
-                grpc_retry("Policy discovery sync", || {
-                    grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered)
-                })
-                .await?
-            }
+            // Sync and re-fetch over a single connection to avoid extra
+            // TLS handshakes.
+            grpc_retry("Policy discovery sync", || {
+                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered)
+            })
+            .await?
         };
 
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
-        if enriched {
-            if let Some(sandbox_name) = sandbox.as_deref() {
-                if let Err(e) =
-                    grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
-                {
-                    warn!(
-                        error = %e,
-                        "Failed to sync enriched policy back to gateway (non-fatal)"
-                    );
-                }
-            }
+        if enriched
+            && let Some(sandbox_name) = sandbox.as_deref()
+            && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
+        {
+            warn!(
+                error = %e,
+                "Failed to sync enriched policy back to gateway (non-fatal)"
+            );
         }
 
         // Build OPA engine from baked-in rules + typed proto data.
@@ -1802,76 +1903,71 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
         parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
     };
 
-    match std::fs::read_to_string(path) {
-        Ok(yaml) => {
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Informational)
-                    .status(StatusId::Success)
-                    .state(StateId::Enabled, "loaded")
+    let Ok(yaml) = std::fs::read_to_string(path) else {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "default")
+                .message(format!(
+                    "No policy file on disk, using restrictive default [path:{}]",
+                    path.display()
+                ))
+                .build()
+        );
+        return restrictive_default_policy();
+    };
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "loaded")
+            .message(format!(
+                "Loaded sandbox policy from container disk [path:{}]",
+                path.display()
+            ))
+            .build()
+    );
+    match parse_sandbox_policy(&yaml) {
+        Ok(policy) => {
+            // Validate the disk-loaded policy for safety.
+            if let Err(violations) = validate_sandbox_policy(&policy) {
+                let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+                ocsf_emit!(DetectionFindingBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .severity(SeverityId::Medium)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .finding_info(
+                        FindingInfo::new(
+                            "unsafe-disk-policy",
+                            "Unsafe Disk Policy Content",
+                        )
+                        .with_desc(&format!(
+                            "Disk policy at {} contains unsafe content: {}",
+                            path.display(),
+                            messages.join("; "),
+                        )),
+                    )
                     .message(format!(
-                        "Loaded sandbox policy from container disk [path:{}]",
+                        "Disk policy contains unsafe content, using restrictive default [path:{}]",
                         path.display()
                     ))
-                    .build()
-            );
-            match parse_sandbox_policy(&yaml) {
-                Ok(policy) => {
-                    // Validate the disk-loaded policy for safety.
-                    if let Err(violations) = validate_sandbox_policy(&policy) {
-                        let messages: Vec<String> =
-                            violations.iter().map(ToString::to_string).collect();
-                        ocsf_emit!(DetectionFindingBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Open)
-                            .severity(SeverityId::Medium)
-                            .action(ActionId::Denied)
-                            .disposition(DispositionId::Blocked)
-                            .finding_info(
-                                FindingInfo::new(
-                                    "unsafe-disk-policy",
-                                    "Unsafe Disk Policy Content",
-                                )
-                                .with_desc(&format!(
-                                    "Disk policy at {} contains unsafe content: {}",
-                                    path.display(),
-                                    messages.join("; "),
-                                )),
-                            )
-                            .message(format!(
-                                "Disk policy contains unsafe content, using restrictive default [path:{}]",
-                                path.display()
-                            ))
-                            .build());
-                        return restrictive_default_policy();
-                    }
-                    policy
-                }
-                Err(e) => {
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "fallback")
-                        .message(format!(
-                            "Failed to parse disk policy, using restrictive default [path:{} error:{e}]",
-                            path.display()
-                        ))
-                        .build());
-                    restrictive_default_policy()
-                }
+                    .build());
+                return restrictive_default_policy();
             }
+            policy
         }
-        Err(_) => {
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Informational)
-                    .status(StatusId::Success)
-                    .state(StateId::Enabled, "default")
-                    .message(format!(
-                        "No policy file on disk, using restrictive default [path:{}]",
-                        path.display()
-                    ))
-                    .build()
-            );
+        Err(e) => {
+            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Other, "fallback")
+                .message(format!(
+                    "Failed to parse disk policy, using restrictive default [path:{} error:{e}]",
+                    path.display()
+                ))
+                .build());
             restrictive_default_policy()
         }
     }
@@ -2036,7 +2132,7 @@ async fn flush_proposals_to_gateway(
         .map(|s| DenialSummary {
             sandbox_id: String::new(),
             host: s.host,
-            port: s.port as u32,
+            port: u32::from(s.port),
             binary: s.binary,
             ancestors: s.ancestors,
             deny_reason: s.deny_reason,
@@ -2202,13 +2298,13 @@ async fn run_policy_poll_loop(
                                 .build()
                         );
                     }
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        if let Err(e) = client
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(e) = client
                             .report_policy_status(sandbox_id, result.version, true, "")
                             .await
-                        {
-                            warn!(error = %e, "Failed to report policy load success");
-                        }
+                    {
+                        warn!(error = %e, "Failed to report policy load success");
                     }
                 }
                 Err(e) => {
@@ -2223,13 +2319,13 @@ async fn run_policy_poll_loop(
                             result.version
                         ))
                         .build());
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        if let Err(report_err) = client
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(report_err) = client
                             .report_policy_status(sandbox_id, result.version, false, &e.to_string())
                             .await
-                        {
-                            warn!(error = %report_err, "Failed to report policy load failure");
-                        }
+                    {
+                        warn!(error = %report_err, "Failed to report policy load failure");
                     }
                 }
             }
@@ -2245,6 +2341,69 @@ async fn run_policy_poll_loop(
         current_config_revision = result.config_revision;
         current_policy_hash = result.policy_hash;
         current_settings = result.settings;
+    }
+}
+
+/// Poll the gateway for provider credential updates and hot-swap the
+/// `SecretResolver` when credentials change.
+async fn run_provider_poll_loop(
+    endpoint: &str,
+    sandbox_id: &str,
+    secret_resolver: &Arc<ArcSwapOption<SecretResolver>>,
+    interval_secs: u64,
+) -> Result<()> {
+    use crate::grpc_client::CachedOpenShellClient;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let client = CachedOpenShellClient::connect(endpoint).await?;
+
+    fn hash_env(env: &std::collections::HashMap<String, String>) -> u64 {
+        let mut keys: Vec<&String> = env.keys().collect();
+        keys.sort();
+        let mut h = DefaultHasher::new();
+        for k in keys {
+            k.hash(&mut h);
+            env[k].hash(&mut h);
+        }
+        h.finish()
+    }
+
+    let mut current_hash: u64 = match client.fetch_provider_environment(sandbox_id).await {
+        Ok(env) => hash_env(&env),
+        Err(_) => 0,
+    };
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let new_env = match client.fetch_provider_environment(sandbox_id).await {
+            Ok(env) => env,
+            Err(e) => {
+                debug!(error = %e, "Provider poll: server unreachable, will retry");
+                continue;
+            }
+        };
+
+        let new_hash = hash_env(&new_env);
+        if new_hash == current_hash {
+            continue;
+        }
+
+        let (_child_env, new_resolver) = SecretResolver::from_provider_env(new_env);
+        secret_resolver.store(new_resolver.map(Arc::new));
+
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "loaded")
+                .message("Provider credentials refreshed via live poll")
+                .build()
+        );
+
+        current_hash = new_hash;
     }
 }
 
@@ -2281,8 +2440,8 @@ fn log_setting_changes(
                             .status(StatusId::Success)
                             .state(StateId::Enabled, "updated")
                             .unmapped("key", serde_json::json!(key))
-                            .unmapped("old", serde_json::json!(old_val.to_string()))
-                            .unmapped("new", serde_json::json!(new_val.to_string()))
+                            .unmapped("old", serde_json::json!(old_val.clone()))
+                            .unmapped("new", serde_json::json!(new_val.clone()))
                             .message(format!(
                                 "Setting changed [key:{key} old:{old_val} new:{new_val}]"
                             ))
@@ -2297,7 +2456,7 @@ fn log_setting_changes(
                         .status(StatusId::Success)
                         .state(StateId::Enabled, "enabled")
                         .unmapped("key", serde_json::json!(key))
-                        .unmapped("value", serde_json::json!(new_val.to_string()))
+                        .unmapped("value", serde_json::json!(new_val.clone()))
                         .message(format!("Setting added [key:{key} value:{new_val}]"))
                         .build()
                 );
@@ -2332,6 +2491,14 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::similar_names,
+    clippy::manual_string_new,
+    clippy::doc_markdown,
+    reason = "Test code: test fixtures often use idiomatic forms not flagged in production."
+)]
 mod tests {
     use super::*;
     use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
@@ -2341,8 +2508,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, symlink};
     use temp_env::with_vars;
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {

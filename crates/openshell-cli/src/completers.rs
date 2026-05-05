@@ -177,22 +177,18 @@ mod tests {
                     name: "alpha".to_string(),
                     gateway_endpoint: "https://alpha.example.com".to_string(),
                     is_remote: true,
-                    gateway_port: 0,
-                    remote_host: None,
-                    resolved_host: None,
                     auth_mode: Some("cloudflare_jwt".to_string()),
-                    edge_team_domain: None,
-                    edge_auth_url: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
 
             let result = complete_gateway_names(OsStr::new("a"));
-            let names: Vec<String> = result
-                .iter()
-                .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
-                .collect();
-            assert!(names.contains(&"alpha".to_string()));
+            assert!(
+                result
+                    .iter()
+                    .any(|candidate| candidate.get_value().to_string_lossy() == "alpha")
+            );
         });
     }
 }

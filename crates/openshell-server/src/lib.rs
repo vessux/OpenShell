@@ -40,9 +40,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
@@ -95,6 +97,9 @@ pub struct ServerState {
     /// can be constructed before `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+
+    /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
+    pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -107,6 +112,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 impl ServerState {
     /// Create new server state.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         store: Arc<Store>,
@@ -115,6 +121,7 @@ impl ServerState {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+        oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         Self {
             config,
@@ -127,6 +134,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            oidc_cache,
         }
     }
 }
@@ -148,14 +156,25 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    let driver = configured_compute_driver(&config)?;
-    if config.ssh_handshake_secret.is_empty() && driver != ComputeDriverKind::Docker {
-        return Err(Error::config(
-            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
-        ));
-    }
-
     let store = Arc::new(Store::connect(database_url).await?);
+
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
+        // Validate RBAC configuration before starting.
+        let policy = auth::authz::AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        };
+        policy.validate().map_err(Error::config)?;
+
+        let cache = auth::oidc::JwksCache::new(oidc)
+            .await
+            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
+        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
@@ -179,6 +198,7 @@ pub async fn run_server(
         sandbox_watch_bus,
         tracing_log_bus,
         supervisor_sessions,
+        oidc_cache,
     ));
 
     // Resume sandboxes that were stopped during the previous gateway
@@ -196,19 +216,30 @@ pub async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    // Bind the TCP listener
-    let listener = TcpListener::bind(config.bind_address)
+    // Bind the primary TCP listener plus any extras requested by drivers.
+    // The same multiplex service is served on each address so the CLI on
+    // loopback and sandboxes on a driver-supplied interface can both reach
+    // the gateway with identical semantics.
+    let mut listeners: Vec<(SocketAddr, TcpListener)> = Vec::new();
+    let primary_listener = TcpListener::bind(config.bind_address)
         .await
         .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.bind_address)))?;
-
     info!(address = %config.bind_address, "Server listening");
+    listeners.push((config.bind_address, primary_listener));
+
+    for extra in &config.extra_bind_addresses {
+        let extra_listener = TcpListener::bind(*extra)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind extra address {extra}: {e}")))?;
+        info!(address = %extra, "Server listening on extra address");
+        listeners.push((*extra, extra_listener));
+    }
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
         let health_listener = TcpListener::bind(health_bind_address).await.map_err(|e| {
             Error::transport(format!(
-                "failed to bind health port {}: {e}",
-                health_bind_address
+                "failed to bind health port {health_bind_address}: {e}"
             ))
         })?;
         info!(address = %health_bind_address, "Health server listening");
@@ -260,21 +291,59 @@ pub async fn run_server(
         None
     };
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    // Coordinate graceful shutdown across every listener: a single broadcast
+    // channel notifies all accept loops, and a `JoinSet` lets us wait for
+    // them to drain before returning.
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut accept_tasks = tokio::task::JoinSet::new();
+    for (addr, listener) in listeners {
+        let service = service.clone();
+        let tls_acceptor = tls_acceptor.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        accept_tasks.spawn(async move {
+            run_accept_loop(addr, listener, service, tls_acceptor, &mut shutdown_rx).await;
+        });
+    }
 
-    // Accept connections until the gateway receives a graceful shutdown signal.
+    shutdown_signal().await;
+    info!("Shutdown signal received; stopping gateway");
+    let _ = shutdown_tx.send(());
+    while accept_tasks.join_next().await.is_some() {}
+
+    state
+        .compute
+        .cleanup_on_shutdown()
+        .await
+        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+
+    Ok(())
+}
+
+/// Drive a single listener until either the listener errors fatally or the
+/// gateway receives a shutdown signal.
+///
+/// All listeners share the same `MultiplexService` and (optional) TLS
+/// acceptor, so callers can run multiple instances of this loop in parallel
+/// to expose the gateway on more than one bind address without forking the
+/// service definition.
+async fn run_accept_loop(
+    bind_addr: SocketAddr,
+    listener: TcpListener,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) {
     loop {
         let (stream, addr) = tokio::select! {
-            _ = &mut shutdown => {
-                info!("Shutdown signal received; stopping gateway");
-                break;
+            _ = shutdown_rx.recv() => {
+                debug!(bind = %bind_addr, "Listener received shutdown");
+                return;
             }
             accepted = listener.accept() => {
                 match accepted {
                     Ok(conn) => conn,
                     Err(e) => {
-                        error!(error = %e, "Failed to accept connection");
+                        error!(error = %e, bind = %bind_addr, "Failed to accept connection");
                         continue;
                     }
                 }
@@ -309,22 +378,14 @@ pub async fn run_server(
             });
         }
     }
-
-    state
-        .compute
-        .cleanup_on_shutdown()
-        .await
-        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
-
-    Ok(())
 }
 
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         tokio::select! {
-            _ = ctrl_c_signal() => {}
-            _ = terminate_signal() => {}
+            () = ctrl_c_signal() => {}
+            () = terminate_signal() => {}
         }
     }
 
@@ -352,6 +413,9 @@ async fn terminate_signal() {
     let _ = signal.recv().await;
 }
 
+// Internal wiring helper: each argument is a distinct piece of runtime state
+// that must be passed through, so the count is justified.
+#[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
@@ -421,8 +485,10 @@ async fn build_compute_runtime(
             let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(openshell_driver_podman::PodmanComputeConfig::default_socket_path);
+                .map_or_else(
+                    openshell_driver_podman::PodmanComputeConfig::default_socket_path,
+                    std::path::PathBuf::from,
+                );
 
             let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
                 .ok()
@@ -469,13 +535,18 @@ async fn build_compute_runtime(
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     match config.compute_drivers.as_slice() {
-        [] => Err(Error::config(
-            "at least one compute driver must be configured",
-        )),
-        [driver @ ComputeDriverKind::Kubernetes]
-        | [driver @ ComputeDriverKind::Vm]
-        | [driver @ ComputeDriverKind::Docker]
-        | [driver @ ComputeDriverKind::Podman] => Ok(*driver),
+        [] => openshell_core::config::detect_driver().ok_or_else(|| {
+            Error::config(
+                "no compute driver configured and auto-detection found no suitable driver; \
+                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+            )
+        }),
+        [
+            driver @ (ComputeDriverKind::Kubernetes
+            | ComputeDriverKind::Vm
+            | ComputeDriverKind::Docker
+            | ComputeDriverKind::Podman),
+        ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -514,10 +585,33 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_empty_drivers() {
+    fn configured_compute_driver_triggers_auto_detection_when_empty() {
         let config = Config::new(None).with_compute_drivers([]);
-        let err = configured_compute_driver(&config).unwrap_err();
-        assert!(err.to_string().contains("at least one compute driver"));
+        // Empty drivers triggers auto-detection, which may return Some or None
+        // depending on the environment. This test verifies the auto-detection path
+        // is taken rather than immediately returning an error.
+        let result = configured_compute_driver(&config);
+        // Either we get a detected driver or an error about none being detected
+        match result {
+            Ok(driver) => {
+                assert!(
+                    matches!(
+                        driver,
+                        ComputeDriverKind::Kubernetes
+                            | ComputeDriverKind::Docker
+                            | ComputeDriverKind::Podman
+                    ),
+                    "auto-detected unexpected driver: {driver:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("no compute driver configured and none detected"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -8,11 +8,12 @@
 //! and chunked transfer encoding for body framing.
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
+use crate::opa::PolicyGenerationGuard;
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const RELAY_BUF_SIZE: usize = 8192;
@@ -325,7 +326,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -333,6 +334,22 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None, cred_inject).await
+}
+
+pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -347,13 +364,32 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    upstream
-        .write_all(&rewrite_result.rewritten)
-        .await
-        .into_diagnostic()?;
+    let empty_resolver = crate::secrets::SecretResolver::default();
+    let final_header = match cred_inject {
+        Some(ci) if !ci.strip_headers.is_empty() || !ci.inject.is_empty() => {
+            let resolver = resolver.unwrap_or(&empty_resolver);
+            crate::secrets::apply_cred_inject(
+                &rewrite_result.rewritten,
+                &ci.strip_headers,
+                &ci.inject,
+                resolver,
+            )
+            .map_err(|e| miette!("cred_inject failed: {e}"))?
+        }
+        _ => rewrite_result.rewritten,
+    };
+
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+
+    upstream.write_all(&final_header).await.into_diagnostic()?;
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         upstream.write_all(overflow).await.into_diagnostic()?;
     }
     let overflow_len = overflow.len() as u64;
@@ -362,11 +398,17 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(client, upstream, remaining).await?;
+                relay_fixed(client, upstream, remaining, generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(client, upstream, &req.raw_header[header_end..]).await?;
+            relay_chunked(
+                client,
+                upstream,
+                &req.raw_header[header_end..],
+                generation_guard,
+            )
+            .await?;
         }
         BodyLength::None => {}
     }
@@ -458,7 +500,7 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
 /// Per RFC 7230 Section 3.3.3, rejects requests containing both
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
-fn parse_body_length(headers: &str) -> Result<BodyLength> {
+pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
     let mut has_te_chunked = false;
     let mut cl_value: Option<u64> = None;
 
@@ -475,12 +517,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
             let len: u64 = val
                 .parse()
                 .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
-            if let Some(prev) = cl_value {
-                if prev != len {
-                    return Err(miette!(
-                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
-                    ));
-                }
+            if let Some(prev) = cl_value
+                && prev != len
+            {
+                return Err(miette!(
+                    "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                ));
             }
             cl_value = Some(len);
         }
@@ -502,7 +544,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
 }
 
 /// Relay exactly `len` bytes from reader to writer.
-async fn relay_fixed<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
+async fn relay_fixed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    len: u64,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -519,6 +566,9 @@ where
                 "Connection closed with {remaining} bytes remaining"
             ));
         }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         writer.write_all(&buf[..n]).await.into_diagnostic()?;
         remaining -= n as u64;
     }
@@ -534,7 +584,12 @@ where
 /// `already_forwarded` are overflow bytes that were already written to the
 /// writer during header parsing. They are seeded into the parser buffer so
 /// termination can still be detected when boundaries span reads.
-async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W, already_forwarded: &[u8]) -> Result<()>
+async fn relay_chunked<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    already_forwarded: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -557,6 +612,9 @@ where
             let n = reader.read(&mut read_buf).await.into_diagnostic()?;
             if n == 0 {
                 return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
             }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
@@ -586,6 +644,9 @@ where
                     let n = reader.read(&mut read_buf).await.into_diagnostic()?;
                     if n == 0 {
                         return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
                     }
                     writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
                     parse_buf.extend_from_slice(&read_buf[..n]);
@@ -620,6 +681,9 @@ where
             if n == 0 {
                 return Err(miette!("Chunked body ended mid-chunk"));
             }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
         }
@@ -643,25 +707,6 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|offset| start + offset)
-}
-
-/// Read and relay a full HTTP response (headers + body) from upstream to client.
-///
-/// Returns a [`RelayOutcome`] indicating whether the connection is reusable,
-/// consumed, or has been upgraded (101 Switching Protocols).
-///
-/// Note: callers that receive `Upgraded` are responsible for switching to
-/// raw bidirectional relay and forwarding the overflow bytes.
-pub(crate) async fn relay_response_to_client<U, C>(
-    upstream: &mut U,
-    client: &mut C,
-    request_method: &str,
-) -> Result<RelayOutcome>
-where
-    U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    relay_response(request_method, upstream, client).await
 }
 
 async fn relay_response<U, C>(
@@ -789,11 +834,11 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining).await?;
+                relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..]).await?;
+            relay_chunked(upstream, client, &buf[header_end..], None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -930,11 +975,122 @@ fn is_benign_close(err: &std::io::Error) -> bool {
     )
 }
 
+pub(crate) async fn echo_http_request<C>(
+    req: &L7Request,
+    client: &mut C,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+    policy_name: &str,
+) -> Result<RelayOutcome>
+where
+    C: AsyncWrite + Unpin,
+{
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |p| p + 4);
+
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("echo: credential rewrite failed: {e}"))?;
+
+    let cred_inject_applied =
+        cred_inject.is_some_and(|ci| !ci.strip_headers.is_empty() || !ci.inject.is_empty());
+
+    let empty_resolver = crate::secrets::SecretResolver::default();
+    let final_header = if let Some(ci) = cred_inject {
+        if !ci.strip_headers.is_empty() || !ci.inject.is_empty() {
+            let r = resolver.unwrap_or(&empty_resolver);
+            crate::secrets::apply_cred_inject(
+                &rewrite_result.rewritten,
+                &ci.strip_headers,
+                &ci.inject,
+                r,
+            )
+            .map_err(|e| miette!("echo: cred_inject failed: {e}"))?
+        } else {
+            rewrite_result.rewritten
+        }
+    } else {
+        rewrite_result.rewritten
+    };
+
+    let header_str = String::from_utf8_lossy(&final_header);
+    let mut lines = header_str.split("\r\n");
+
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let full_target = parts.next().unwrap_or("").to_string();
+
+    let (path, query) = match full_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(format!("?{q}"))),
+        None => (full_target, None),
+    };
+
+    let mut headers = serde_json::Map::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(
+                name.trim().to_string(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+        }
+    }
+
+    let body_length: serde_json::Value = match req.body_length {
+        BodyLength::ContentLength(n) => serde_json::Value::Number(n.into()),
+        BodyLength::Chunked => serde_json::Value::String("chunked".to_string()),
+        BodyLength::None => serde_json::Value::Null,
+    };
+
+    let json = serde_json::json!({
+        "echo": true,
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": serde_json::Value::Object(headers),
+        "body_length": body_length,
+        "policy": policy_name,
+        "cred_inject_applied": cred_inject_applied,
+    });
+
+    let body = serde_json::to_string_pretty(&json)
+        .map_err(|e| miette!("echo: JSON serialization failed: {e}"))?;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    Ok(RelayOutcome::Reusable)
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::iter_on_single_items,
+    clippy::manual_string_new,
+    clippy::collapsible_if,
+    clippy::cast_possible_truncation,
+    reason = "Test code: test fixtures and explicit value-shape assertions are idiomatic in tests."
+)]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
     use base64::Engine as _;
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
     #[test]
     fn parse_content_length() {
@@ -1886,6 +2042,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -1943,6 +2100,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -1955,6 +2113,47 @@ mod tests {
         );
 
         upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_http_request_with_resolver_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            None,
+            Some(&guard),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale generation must stop relay before upstream write"
+        );
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "stale request bytes must not reach upstream"
+        );
     }
 
     #[test]
@@ -2068,6 +2267,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
             ),
         )
         .await
@@ -2152,6 +2352,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
             ),
         )
         .await
@@ -2240,6 +2441,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver,
+                None,
             ),
         )
         .await
@@ -2542,5 +2744,114 @@ mod tests {
             result.is_err(),
             "Relay should fail when path placeholder cannot be resolved"
         );
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_returns_json_with_rewritten_headers() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-real-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.unwrap();
+
+        let placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+
+        let raw_header = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: {placeholder}\r\nContent-Type: application/json\r\n\r\n"
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: BodyLength::ContentLength(42),
+        };
+
+        let cred_inject = crate::l7::CredInjectConfig {
+            strip_headers: vec!["x-api-key".to_string()],
+            inject: vec![crate::secrets::CredInjectDirective {
+                header: "x-api-key".to_string(),
+                from_credential: "ANTHROPIC_API_KEY".to_string(),
+            }],
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(
+            &req,
+            &mut client_write,
+            Some(&resolver),
+            Some(&cred_inject),
+            "test_policy",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["path"], "/v1/messages");
+        assert_eq!(json["headers"]["x-api-key"], "sk-ant-real-key");
+        assert!(json["headers"].get("Host").is_some() || json["headers"].get("host").is_some());
+        assert_eq!(json["body_length"], 42);
+        assert_eq!(json["policy"], "test_policy");
+        assert_eq!(json["cred_inject_applied"], true);
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_without_cred_inject() {
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/models".to_string(),
+            query_params: {
+                let mut m = HashMap::new();
+                m.insert("limit".to_string(), vec!["10".to_string()]);
+                m
+            },
+            raw_header: b"GET /v1/models?limit=10 HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer token\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(&req, &mut client_write, None, None, "my_policy")
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let json: serde_json::Value = serde_json::from_str(&response[body_start..]).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["path"], "/v1/models");
+        assert_eq!(json["query"], "?limit=10");
+        assert_eq!(json["headers"]["Authorization"], "Bearer token");
+        assert_eq!(json["cred_inject_applied"], false);
+        assert!(json["body_length"].is_null() || json["body_length"] == 0);
     }
 }

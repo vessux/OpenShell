@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared sandbox policy parsing and defaults for OpenShell.
+//! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
@@ -17,8 +17,9 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    CredInjectConfig, CredInjectHeader, FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher,
+    L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    SandboxPolicy, TrustCheckConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,8 @@ struct NetworkPolicyRuleDef {
     endpoints: Vec<NetworkEndpointDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binaries: Vec<NetworkBinaryDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_secrets: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,8 +118,46 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    /// Optional credential injection config. When present, the L7 proxy strips
+    /// the specified headers and injects provider-managed credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cred_inject: Option<CredInjectDef>,
+    /// When true, the proxy returns post-rewrite headers as JSON instead of
+    /// forwarding upstream. For wire proof testing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    echo: bool,
+    /// Optional trust check config. When set, the proxy queries deps.dev for
+    /// vulnerability/license data before allowing package downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_check: Option<TrustCheckDef>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strip_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inject: Vec<CredInjectHeaderDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectHeaderDef {
+    header: String,
+    from_credential: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustCheckDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registry: String,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
 }
@@ -268,6 +309,22 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            cred_inject: e.cred_inject.map(|ci| CredInjectConfig {
+                                provider: ci.provider,
+                                strip_headers: ci.strip_headers,
+                                inject: ci
+                                    .inject
+                                    .into_iter()
+                                    .map(|h| CredInjectHeader {
+                                        header: h.header,
+                                        from_credential: h.from_credential,
+                                    })
+                                    .collect(),
+                            }),
+                            echo: e.echo,
+                            trust_check: e.trust_check.map(|tc| TrustCheckConfig {
+                                registry: tc.registry,
+                            }),
                         }
                     })
                     .collect(),
@@ -279,6 +336,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         ..Default::default()
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets,
             };
             (key, proto_rule)
         })
@@ -369,12 +427,12 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                                 .query
                                                 .into_iter()
                                                 .map(|(key, matcher)| {
-                                                    let yaml_matcher = if !matcher.any.is_empty() {
+                                                    let yaml_matcher = if matcher.any.is_empty() {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    } else {
                                                         QueryMatcherDef::Any(QueryAnyDef {
                                                             any: matcher.any,
                                                         })
-                                                    } else {
-                                                        QueryMatcherDef::Glob(matcher.glob)
                                                     };
                                                     (key, yaml_matcher)
                                                 })
@@ -395,12 +453,12 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                         .query
                                         .iter()
                                         .map(|(key, matcher)| {
-                                            let yaml_matcher = if !matcher.any.is_empty() {
+                                            let yaml_matcher = if matcher.any.is_empty() {
+                                                QueryMatcherDef::Glob(matcher.glob.clone())
+                                            } else {
                                                 QueryMatcherDef::Any(QueryAnyDef {
                                                     any: matcher.any.clone(),
                                                 })
-                                            } else {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
                                             };
                                             (key.clone(), yaml_matcher)
                                         })
@@ -408,6 +466,22 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            cred_inject: e.cred_inject.as_ref().map(|ci| CredInjectDef {
+                                provider: ci.provider.clone(),
+                                strip_headers: ci.strip_headers.clone(),
+                                inject: ci
+                                    .inject
+                                    .iter()
+                                    .map(|h| CredInjectHeaderDef {
+                                        header: h.header.clone(),
+                                        from_credential: h.from_credential.clone(),
+                                    })
+                                    .collect(),
+                            }),
+                            echo: e.echo,
+                            trust_check: e.trust_check.as_ref().map(|tc| TrustCheckDef {
+                                registry: tc.registry.clone(),
+                            }),
                         }
                     })
                     .collect(),
@@ -419,6 +493,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         harness: false,
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets.clone(),
             };
             (key.clone(), yaml_rule)
         })
@@ -535,9 +610,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
 /// the required `"sandbox"` value. Call this before validation so that
 /// policies without an explicit process section get the correct default.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
-    let process = policy
-        .process
-        .get_or_insert_with(|| ProcessPolicy::default());
+    let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
         process.run_as_user = "sandbox".into();
     }
@@ -812,7 +885,7 @@ network_policies:
     /// Verify that the network policy `name` field survives the round-trip.
     #[test]
     fn round_trip_preserves_policy_name() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   my_api:
@@ -822,7 +895,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/curl
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto1.network_policies["my_api"].name, "my-custom-api-name");
 
@@ -891,7 +964,7 @@ network_policies:
 
     #[test]
     fn parse_policy_with_network_rules() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -900,7 +973,7 @@ network_policies:
       - { host: example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         assert_eq!(policy.network_policies.len(), 1);
         let rule = &policy.network_policies["test"];
@@ -1277,7 +1350,7 @@ network_policies:
 
     #[test]
     fn parse_ports_array() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1286,7 +1359,7 @@ network_policies:
       - { host: api.example.com, ports: [80, 443] }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![80, 443]);
@@ -1296,7 +1369,7 @@ network_policies:
 
     #[test]
     fn parse_single_port_normalized_to_ports() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1305,7 +1378,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
@@ -1314,7 +1387,7 @@ network_policies:
 
     #[test]
     fn round_trip_preserves_multi_port() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1326,7 +1399,7 @@ network_policies:
           - 443
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1339,7 +1412,7 @@ network_policies:
 
     #[test]
     fn serialize_single_port_uses_compact_form() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1348,7 +1421,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         // Should use compact `port: 443` form, not `ports: [443]`
@@ -1493,7 +1566,7 @@ network_policies:
 
     #[test]
     fn parse_rejects_unknown_fields_in_deny_rule() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1504,23 +1577,128 @@ network_policies:
           - method: POST
             path: /foo
             bogus: true
-"#;
+";
         assert!(parse_sandbox_policy(yaml).is_err());
     }
 
     #[test]
     fn rejects_port_above_65535() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
     endpoints:
       - host: example.com
         port: 70000
-"#;
+";
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn allowed_secrets_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github_only:
+    binaries:
+      - path: /usr/bin/gh
+    endpoints:
+      - host: api.github.com
+        port: 443
+    allowed_secrets:
+      - GITHUB_TOKEN
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let rule = &proto.network_policies["github_only"];
+        assert_eq!(rule.allowed_secrets, vec!["GITHUB_TOKEN"]);
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto2.network_policies["github_only"].allowed_secrets,
+            vec!["GITHUB_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn cred_inject_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  anthropic_strict:
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        cred_inject:
+          provider: anthropic-prod
+          strip_headers:
+            - Authorization
+            - x-api-key
+            - Cookie
+          inject:
+            - header: x-api-key
+              from_credential: ANTHROPIC_API_KEY
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["anthropic_strict"].endpoints[0];
+
+        let ci = ep.cred_inject.as_ref().expect("cred_inject should be set");
+        assert_eq!(ci.provider, "anthropic-prod");
+        assert_eq!(
+            ci.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci.inject.len(), 1);
+        assert_eq!(ci.inject[0].header, "x-api-key");
+        assert_eq!(ci.inject[0].from_credential, "ANTHROPIC_API_KEY");
+
+        // Round-trip: serialize back to YAML and re-parse.
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep2 = &proto2.network_policies["anthropic_strict"].endpoints[0];
+        let ci2 = ep2
+            .cred_inject
+            .as_ref()
+            .expect("cred_inject should survive round-trip");
+        assert_eq!(ci2.provider, "anthropic-prod");
+        assert_eq!(
+            ci2.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci2.inject.len(), 1);
+        assert_eq!(ci2.inject[0].header, "x-api-key");
+        assert_eq!(ci2.inject[0].from_credential, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn trust_check_round_trips_through_proto() {
+        let yaml = r#"
+version: 1
+network_policies:
+  pip:
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        trust_check:
+          registry: pypi
+"#;
+        let policy = parse_sandbox_policy(yaml).unwrap();
+        let ep = &policy.network_policies["pip"].endpoints[0];
+        let tc = ep.trust_check.as_ref().expect("trust_check should be set");
+        assert_eq!(tc.registry, "pypi");
+
+        let yaml_back = serialize_sandbox_policy(&policy).unwrap();
+        let policy2 = parse_sandbox_policy(&yaml_back).unwrap();
+        let tc2 = policy2.network_policies["pip"].endpoints[0]
+            .trust_check
+            .as_ref()
+            .expect("trust_check should survive round-trip");
+        assert_eq!(tc2.registry, "pypi");
     }
 }

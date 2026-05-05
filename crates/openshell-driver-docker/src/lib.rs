@@ -8,8 +8,8 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest, HostConfig,
+    Mount, MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -17,7 +17,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -38,7 +38,6 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
-use url::{Host, Url};
 
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -55,8 +54,7 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_COMMAND: &str = "sleep infinity";
-const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
-const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
+const HOST_OPENSHELL_INTERNAL_HOSTS_ENTRY: &str = "host.openshell.internal:127.0.0.1";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -159,6 +157,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+    supports_gpu: bool,
 }
 
 #[derive(Clone)]
@@ -195,6 +194,12 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let supports_gpu = docker
+            .info()
+            .await
+            .ok()
+            .and_then(|info| info.cdi_spec_dirs)
+            .is_some_and(|dirs| !dirs.is_empty());
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
@@ -212,6 +217,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
+                supports_gpu,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -230,12 +236,15 @@ impl DockerComputeDriver {
             driver_name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: false,
+            supports_gpu: self.config.supports_gpu,
             gpu_count: 0,
         }
     }
 
-    fn validate_sandbox(sandbox: &DriverSandbox) -> Result<(), Status> {
+    fn validate_sandbox(
+        sandbox: &DriverSandbox,
+        config: &DockerDriverRuntimeConfig,
+    ) -> Result<(), Status> {
         let spec = sandbox
             .spec
             .as_ref()
@@ -250,9 +259,9 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu {
+        if spec.gpu && !config.supports_gpu {
             return Err(Status::failed_precondition(
-                "docker compute driver does not support gpu sandboxes",
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
         if !template.agent_socket_path.trim().is_empty() {
@@ -300,7 +309,7 @@ impl DockerComputeDriver {
     }
 
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
-        Self::validate_sandbox(sandbox)?;
+        Self::validate_sandbox(sandbox, &self.config)?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -674,7 +683,7 @@ impl ComputeDriver for DockerComputeDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Self::validate_sandbox(&sandbox)?;
+        Self::validate_sandbox(&sandbox, &self.config)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -841,7 +850,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.insert(
         "OPENSHELL_ENDPOINT".to_string(),
-        container_visible_openshell_endpoint(&config.grpc_endpoint),
+        config.grpc_endpoint.clone(),
     );
     environment.insert("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone());
     environment.insert("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone());
@@ -874,6 +883,16 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
+}
+
+fn docker_gpu_device_requests(gpu: bool) -> Option<Vec<DeviceRequest>> {
+    gpu.then(|| {
+        vec![DeviceRequest {
+            driver: Some("cdi".to_string()),
+            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
+            ..Default::default()
+        }]
+    })
 }
 
 fn build_container_create_body(
@@ -917,6 +936,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
+            device_requests: docker_gpu_device_requests(spec.gpu),
             mounts: Some(build_mounts(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -928,10 +948,27 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
-            extra_hosts: Some(vec![
-                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-                format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
-            ]),
+            // The sandbox supervisor needs to bind-mount `/run/netns`,
+            // mark it shared, and create per-process network namespaces.
+            // Docker's default AppArmor profile (`docker-default`) denies
+            // these mount operations even with CAP_SYS_ADMIN, so we opt
+            // out of AppArmor confinement for sandbox containers. The
+            // sandbox enforces its own security boundary via Landlock,
+            // seccomp, OPA policy evaluation, and the dedicated network
+            // namespace it sets up for the agent — AppArmor at the
+            // container layer is redundant relative to those controls
+            // and conflicts with them in this case.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
+            // Run in the host network namespace so a gateway bound to
+            // 127.0.0.1 is reachable from the supervisor as 127.0.0.1.
+            // The supervisor still creates a nested network namespace for
+            // the sandboxed workload and forces workload traffic through
+            // its policy proxy.
+            network_mode: Some("host".to_string()),
+            // Keep a stable host alias available inside the container without
+            // requiring users to edit the host's /etc/hosts. In host network
+            // mode this resolves back to the host loopback gateway.
+            extra_hosts: Some(vec![HOST_OPENSHELL_INTERNAL_HOSTS_ENTRY.to_string()]),
             ..Default::default()
         }),
         ..Default::default()
@@ -960,25 +997,6 @@ fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
         .filter(|level| !level.is_empty())
         .unwrap_or(default_level)
         .to_string()
-}
-
-fn container_visible_openshell_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-
-    let should_rewrite = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-
-    if should_rewrite && url.set_host(Some(HOST_OPENSHELL_INTERNAL)).is_ok() {
-        return url.to_string();
-    }
-
-    endpoint.to_string()
 }
 
 fn docker_resource_limits(
@@ -1607,7 +1625,7 @@ fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> 
         ))
     })?;
     temp.as_file().sync_all().map_err(|err| {
-        Error::config(format!("failed to sync supervisor binary temp file: {err}",))
+        Error::config(format!("failed to sync supervisor binary temp file: {err}"))
     })?;
 
     #[cfg(unix)]

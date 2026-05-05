@@ -101,7 +101,7 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
 /// `false` to skip bootstrap. Otherwise returns `true` — a gateway is created
 /// automatically without prompting the user.
 pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
-    if let Some(false) = override_value {
+    if override_value == Some(false) {
         return Ok(false);
     }
     Ok(true)
@@ -191,13 +191,22 @@ pub async fn run_bootstrap(
 
     // Deploy the gateway. The deploy flow auto-resumes from existing state
     // when it finds one. If that fails, fall back to a full recreate.
-    let handle = match deploy_gateway_with_panel(build_options(false), &gateway_name, location)
-        .await
+    let handle = match Box::pin(deploy_gateway_with_panel(
+        build_options(false),
+        &gateway_name,
+        location,
+    ))
+    .await
     {
         Ok(handle) => handle,
         Err(resume_err) => {
             tracing::warn!("auto-bootstrap resume failed, falling back to recreate: {resume_err}");
-            deploy_gateway_with_panel(build_options(true), &gateway_name, location).await?
+            Box::pin(deploy_gateway_with_panel(
+                build_options(true),
+                &gateway_name,
+                location,
+            ))
+            .await?
         }
     };
     let server = handle.gateway_endpoint().to_string();
