@@ -97,6 +97,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: Vec::new(),
+            allowed_secrets: Vec::new(),
         }
     }
 

@@ -3998,6 +3998,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -4642,6 +4643,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         handle_submit_policy_analysis(
@@ -4794,6 +4796,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 
@@ -4877,6 +4880,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-1".to_string(),
@@ -4945,6 +4949,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 },
             ))
             .collect(),
@@ -4973,6 +4978,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-merge".to_string(),
@@ -5046,6 +5052,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 },
             ))
             .collect(),
@@ -5074,6 +5081,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-new".to_string(),
@@ -5210,6 +5218,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5231,6 +5240,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5249,6 +5259,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5267,6 +5278,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5286,6 +5298,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -5303,6 +5316,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());

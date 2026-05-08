@@ -56,6 +56,9 @@ bytes = { workspace = true }
 # UUID
 uuid = { workspace = true }
 
+# Lock-free atomic pointer swap
+arc-swap = "1"
+
 # Encoding
 base64 = { workspace = true }
 flate2 = "1"
@@ -63,6 +66,12 @@ sha1 = "0.10"
 
 # IP network / CIDR parsing
 ipnet = "2"
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
