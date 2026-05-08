@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{BodyLength, L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::secrets::{self, SecretResolver};
@@ -17,7 +17,7 @@ use openshell_ocsf::{
     NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
@@ -36,6 +36,14 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Per-endpoint credential strip/inject configuration.
+    pub(crate) cred_inject: Option<super::CredInjectConfig>,
+    /// When true, return post-rewrite headers as JSON instead of forwarding upstream.
+    pub(crate) echo: bool,
+    /// Trust cache for deps.dev lookups (shared across connections).
+    pub(crate) trust_cache: Option<Arc<crate::trust::TrustCache>>,
+    /// Per-endpoint trust check config (registry type).
+    pub(crate) trust_check: Option<super::TrustCheckConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +251,8 @@ where
             graphql: graphql_info.clone(),
         };
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         let parse_error_reason = graphql_info
             .as_ref()
             .and_then(|info| info.error.as_deref())
@@ -251,7 +261,7 @@ where
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(&engine, ctx, &request_info)?
+            evaluate_l7_request(&engine, ctx, &request_info, trust_result.as_ref())?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -288,6 +298,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 Some(engine.generation_guard()),
+                ctx.cred_inject.as_ref(),
             )
             .await?;
             match outcome {
@@ -486,8 +497,11 @@ where
             graphql: None,
         };
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) =
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -548,31 +562,126 @@ where
             ocsf_emit!(event);
         }
 
+        // Trust-specific OCSF events
+        if let Some(ref trust) = trust_result {
+            if trust.lookup_failed {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Low)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_LOOKUP_FAILED {} {}@{} — allowing (fail-open)",
+                        request_info.action, trust.package_name, trust.version,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.critical_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_DENIED {} {}@{} — {} critical vulnerabilities",
+                        request_info.action,
+                        trust.package_name,
+                        trust.version,
+                        trust.critical_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.high_vulns > 0 {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Medium)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_AUDIT {} {}@{} — {} high vulnerabilities",
+                        request_info.action, trust.package_name, trust.version, trust.high_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            }
+        }
+
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
-                &req,
-                client,
-                upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
-            )
-            .await?;
-            match outcome {
-                RelayOutcome::Reusable => {} // continue loop
-                RelayOutcome::Consumed => {
-                    debug!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        "Upstream connection not reusable, closing L7 relay"
-                    );
-                    return Ok(());
+            if ctx.echo {
+                // Echo mode: drain request body, then return post-rewrite headers as JSON.
+                let header_end = req
+                    .raw_header
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(req.raw_header.len(), |p| p + 4);
+                let overflow_len = req.raw_header[header_end..].len() as u64;
+                if let BodyLength::ContentLength(len) = req.body_length {
+                    let remaining = len.saturating_sub(overflow_len);
+                    if remaining > 0 {
+                        let mut discard = tokio::io::sink();
+                        let mut take = (&mut *client).take(remaining);
+                        tokio::io::copy(&mut take, &mut discard)
+                            .await
+                            .into_diagnostic()?;
+                    }
                 }
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+
+                let outcome = crate::l7::rest::echo_http_request(
+                    &req,
+                    client,
+                    ctx.secret_resolver.as_deref(),
+                    ctx.cred_inject.as_ref(),
+                    &ctx.policy_name,
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {}
+                    _ => return Ok(()),
+                }
+            } else {
+                // Forward request to upstream and relay response
+                let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                    &req,
+                    client,
+                    upstream,
+                    ctx.secret_resolver.as_deref(),
+                    Some(engine.generation_guard()),
+                    ctx.cred_inject.as_ref(),
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {} // continue loop
+                    RelayOutcome::Consumed => {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            "Upstream connection not reusable, closing L7 relay"
+                        );
+                        return Ok(());
+                    }
+                    RelayOutcome::Upgraded { overflow } => {
+                        return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port)
+                            .await;
+                    }
                 }
             }
         } else {
@@ -589,6 +698,23 @@ where
             return Ok(());
         }
     }
+}
+
+/// Extract trust data for the request when both a trust-check config and a
+/// trust cache are configured on the L7 endpoint. Returns `None` when trust is
+/// disabled, the registry is unrecognized, or the request target does not parse
+/// into a package reference.
+async fn extract_trust_result(
+    ctx: &L7EvalContext,
+    request_info: &L7RequestInfo,
+) -> Option<crate::trust::TrustResult> {
+    let (Some(tc), Some(cache)) = (&ctx.trust_check, &ctx.trust_cache) else {
+        return None;
+    };
+    let registry = crate::trust::Registry::parse(&tc.registry)?;
+    let pkg =
+        crate::trust::parse_package_ref(registry, &request_info.action, &request_info.target)?;
+    Some(cache.get_or_fetch(&pkg).await)
 }
 
 fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
@@ -696,6 +822,8 @@ where
             graphql: Some(graphql_info.clone()),
         };
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         // Malformed or ambiguous GraphQL requests, such as duplicated GET
         // control parameters, are rejected before policy evaluation. This
         // keeps parser-differential cases fail-closed even if the endpoint is
@@ -708,7 +836,7 @@ where
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(engine, ctx, &request_info)?
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -765,6 +893,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 Some(engine.generation_guard()),
+                ctx.cred_inject.as_ref(),
             )
             .await?;
             match outcome {
@@ -849,6 +978,7 @@ pub fn evaluate_l7_request(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
+    trust: Option<&crate::trust::TrustResult>,
 ) -> Result<(bool, String)> {
     if engine.is_stale() {
         return Err(miette!(
@@ -858,7 +988,7 @@ pub fn evaluate_l7_request(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let mut input_json = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -875,6 +1005,21 @@ pub fn evaluate_l7_request(
             "graphql": request.graphql.clone(),
         }
     });
+
+    if let Some(trust) = trust {
+        input_json["trust"] = serde_json::json!({
+            "package": trust.package_name,
+            "version": trust.version,
+            "registry": trust.registry,
+            "critical_vulns": trust.critical_vulns,
+            "high_vulns": trust.high_vulns,
+            "medium_vulns": trust.medium_vulns,
+            "low_vulns": trust.low_vulns,
+            "license": trust.license,
+            "is_stale": trust.is_stale,
+            "lookup_failed": trust.lookup_failed,
+        });
+    }
 
     let mut engine = engine
         .engine()
@@ -1007,6 +1152,7 @@ where
             upstream,
             resolver,
             Some(generation_guard),
+            None,
         )
         .await?;
 
@@ -1127,6 +1273,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1214,6 +1364,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
