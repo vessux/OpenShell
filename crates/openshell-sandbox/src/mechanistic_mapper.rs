@@ -157,6 +157,7 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             name: rule_name.clone(),
             endpoints: vec![endpoint],
             binaries,
+            ..Default::default()
         };
 
         // Compute confidence.

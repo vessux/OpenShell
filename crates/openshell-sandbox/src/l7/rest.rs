@@ -326,7 +326,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -334,12 +334,36 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None, cred_inject)
+        .await
+}
+
+/// Apply optional `cred_inject` (strip + inject) over already-rewritten header
+/// bytes. Returns the original bytes unchanged when no strip/inject directive
+/// is configured. `error_tag` is prepended to the failure message so callers
+/// can distinguish forward vs echo paths in logs.
+fn apply_cred_inject_or_default(
+    rewritten: Vec<u8>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    error_tag: &str,
+) -> Result<Vec<u8>> {
+    let Some(ci) = cred_inject else {
+        return Ok(rewritten);
+    };
+    if ci.strip_headers.is_empty() && ci.inject.is_empty() {
+        return Ok(rewritten);
+    }
+    let empty_resolver = crate::secrets::SecretResolver::default();
+    let r = resolver.unwrap_or(&empty_resolver);
+    crate::secrets::apply_cred_inject(&rewritten, &ci.strip_headers, &ci.inject, r)
+        .map_err(|e| miette!("{error_tag}cred_inject failed: {e}"))
 }
 
 pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
@@ -348,6 +372,7 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -362,14 +387,14 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
+    let final_header =
+        apply_cred_inject_or_default(rewrite_result.rewritten, cred_inject, resolver, "")?;
+
     if let Some(guard) = generation_guard {
         guard.ensure_current()?;
     }
 
-    upstream
-        .write_all(&rewrite_result.rewritten)
-        .await
-        .into_diagnostic()?;
+    upstream.write_all(&final_header).await.into_diagnostic()?;
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
@@ -959,6 +984,92 @@ fn is_benign_close(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
     )
+}
+
+pub(crate) async fn echo_http_request<C>(
+    req: &L7Request,
+    client: &mut C,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+    policy_name: &str,
+) -> Result<RelayOutcome>
+where
+    C: AsyncWrite + Unpin,
+{
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |p| p + 4);
+
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("echo: credential rewrite failed: {e}"))?;
+
+    let cred_inject_applied =
+        cred_inject.is_some_and(|ci| !ci.strip_headers.is_empty() || !ci.inject.is_empty());
+
+    let final_header =
+        apply_cred_inject_or_default(rewrite_result.rewritten, cred_inject, resolver, "echo: ")?;
+
+    let header_str = String::from_utf8_lossy(&final_header);
+    let mut lines = header_str.split("\r\n");
+
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let full_target = parts.next().unwrap_or("").to_string();
+
+    let (path, query) = match full_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(format!("?{q}"))),
+        None => (full_target, None),
+    };
+
+    let mut headers = serde_json::Map::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(
+                name.trim().to_string(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+        }
+    }
+
+    let body_length: serde_json::Value = match req.body_length {
+        BodyLength::ContentLength(n) => serde_json::Value::Number(n.into()),
+        BodyLength::Chunked => serde_json::Value::String("chunked".to_string()),
+        BodyLength::None => serde_json::Value::Null,
+    };
+
+    let json = serde_json::json!({
+        "echo": true,
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": serde_json::Value::Object(headers),
+        "body_length": body_length,
+        "policy": policy_name,
+        "cred_inject_applied": cred_inject_applied,
+    });
+
+    let body = serde_json::to_string_pretty(&json)
+        .map_err(|e| miette!("echo: JSON serialization failed: {e}"))?;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    Ok(RelayOutcome::Reusable)
 }
 
 #[cfg(test)]
@@ -1927,6 +2038,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -1984,6 +2096,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -2023,6 +2136,7 @@ mod tests {
             &mut proxy_to_upstream,
             None,
             Some(&guard),
+            None,
         )
         .await;
         assert!(
@@ -2150,6 +2264,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
             ),
         )
         .await
@@ -2234,6 +2349,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
             ),
         )
         .await
@@ -2322,6 +2438,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver,
+                None,
             ),
         )
         .await
@@ -2624,5 +2741,114 @@ mod tests {
             result.is_err(),
             "Relay should fail when path placeholder cannot be resolved"
         );
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_returns_json_with_rewritten_headers() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-real-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.unwrap();
+
+        let placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+
+        let raw_header = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: {placeholder}\r\nContent-Type: application/json\r\n\r\n"
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: BodyLength::ContentLength(42),
+        };
+
+        let cred_inject = crate::l7::CredInjectConfig {
+            strip_headers: vec!["x-api-key".to_string()],
+            inject: vec![crate::secrets::CredInjectDirective {
+                header: "x-api-key".to_string(),
+                from_credential: "ANTHROPIC_API_KEY".to_string(),
+            }],
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(
+            &req,
+            &mut client_write,
+            Some(&resolver),
+            Some(&cred_inject),
+            "test_policy",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["path"], "/v1/messages");
+        assert_eq!(json["headers"]["x-api-key"], "sk-ant-real-key");
+        assert!(json["headers"].get("Host").is_some() || json["headers"].get("host").is_some());
+        assert_eq!(json["body_length"], 42);
+        assert_eq!(json["policy"], "test_policy");
+        assert_eq!(json["cred_inject_applied"], true);
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_without_cred_inject() {
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/models".to_string(),
+            query_params: {
+                let mut m = HashMap::new();
+                m.insert("limit".to_string(), vec!["10".to_string()]);
+                m
+            },
+            raw_header: b"GET /v1/models?limit=10 HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer token\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(&req, &mut client_write, None, None, "my_policy")
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let json: serde_json::Value = serde_json::from_str(&response[body_start..]).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["path"], "/v1/models");
+        assert_eq!(json["query"], "?limit=10");
+        assert_eq!(json["headers"]["Authorization"], "Bearer token");
+        assert_eq!(json["cred_inject_applied"], false);
+        assert!(json["body_length"].is_null() || json["body_length"] == 0);
     }
 }

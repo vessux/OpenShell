@@ -788,6 +788,10 @@ network_policies:
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,
@@ -800,7 +804,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .expect("tunnel engine should clone");
         let (allowed, reason) =
-            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &ctx, &request_info)
+            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &ctx, &request_info, None)
                 .expect("evaluation should complete");
 
         assert!(allowed, "expected query to be allowed, got {reason}");
