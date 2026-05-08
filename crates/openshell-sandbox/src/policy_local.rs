@@ -1019,6 +1019,7 @@ fn network_rule_from_json(
         name: rule.name.unwrap_or_default(),
         endpoints,
         binaries,
+        allowed_secrets: Vec::new(),
     })
 }
 
@@ -1097,6 +1098,12 @@ fn network_endpoint_from_json(
         graphql_persisted_queries: HashMap::new(),
         graphql_max_body_bytes: 0,
         path: String::new(),
+        // Fork-added fields default to None/false — agent-authored policy
+        // proposals from policy.local don't construct cred_inject or trust
+        // mechanisms; those are gateway-side concerns.
+        cred_inject: None,
+        echo: false,
+        trust_check: None,
     })
 }
 

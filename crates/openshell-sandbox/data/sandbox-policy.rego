@@ -219,6 +219,11 @@ deny_request if {
 	_policy_denies_l7(policy)
 }
 
+# openlock fork: package trust check produces a deny.
+deny_request if {
+	deny_trust_critical
+}
+
 # --- L7 deny rule matching: REST method + path + query ---
 
 request_denied_for_endpoint(request, endpoint) if {
@@ -333,6 +338,7 @@ request_deny_reason := reason if {
 request_deny_reason := reason if {
 	input.request
 	deny_request
+	not deny_trust_critical
 	graphql_request_has_operations(input.request)
 	not graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
 	reason := "GraphQL operation blocked by endpoint policy"
@@ -350,8 +356,18 @@ request_deny_reason := reason if {
 request_deny_reason := reason if {
 	input.request
 	deny_request
+	not deny_trust_critical
 	not graphql_request_has_operations(input.request)
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
+}
+
+# openlock fork: trust-API critical-vuln deny reason takes precedence over generic deny rule reason.
+request_deny_reason := reason if {
+	input.trust
+	deny_trust_critical
+	pkg := object.get(input.trust, "package", "unknown")
+	version := object.get(input.trust, "version", "unknown")
+	reason := sprintf("package %s@%s has critical vulnerabilities", [pkg, version])
 }
 
 request_deny_reason := reason if {
@@ -686,4 +702,38 @@ endpoint_has_extended_config(ep) if {
 
 endpoint_has_extended_config(ep) if {
 	ep.tls
+}
+
+########################################
+# openlock fork additions: allowed_secrets
+########################################
+
+# Return the allowed_secrets list from the matched network policy rule.
+# Empty list (or absent field) means all credentials are allowed.
+matched_allowed_secrets := secrets if {
+	matched_network_policy
+	policy := data.network_policies[matched_network_policy]
+	secrets := object.get(policy, "allowed_secrets", [])
+}
+
+########################################
+# openlock fork additions: trust_check
+########################################
+
+# Deny if package has critical vulnerabilities.
+deny_trust_critical if {
+	input.trust
+	input.trust.critical_vulns > 0
+}
+
+# Audit (allow but log) if package has high vulnerabilities.
+audit_trust_high if {
+	input.trust
+	input.trust.high_vulns > 0
+}
+
+# Audit if trust lookup failed (fail-open with visibility).
+audit_trust_lookup_failed if {
+	input.trust
+	input.trust.lookup_failed == true
 }

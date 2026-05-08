@@ -26,7 +26,9 @@ mod secrets;
 mod skills;
 mod ssh;
 mod supervisor_session;
+pub(crate) mod trust;
 
+use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -406,6 +408,8 @@ pub async fn run_sandbox(
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
+    let trust_cache = Arc::new(trust::TrustCache::new(Duration::from_secs(3600)));
+
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
         .as_ref()
@@ -626,6 +630,7 @@ pub async fn run_sandbox(
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
             denial_tx,
+            trust_cache.clone(),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)
@@ -2533,6 +2538,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         current_settings = result.settings;
     }
 }
+
 
 /// Extract a bool value from an effective setting, if present.
 fn extract_bool_setting(

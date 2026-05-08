@@ -157,6 +157,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3639,8 +3648,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "apollo-parser",
+ "arc-swap",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "clap",
  "flate2",
  "futures",
@@ -3659,6 +3670,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rcgen",
  "regorus",
+ "reqwest 0.12.28",
  "russh",
  "rustix 1.1.4",
  "rustls",

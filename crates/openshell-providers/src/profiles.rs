@@ -341,6 +341,7 @@ impl ProviderTypeProfile {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
+            allowed_secrets: Vec::new(),
         }
     }
 }
@@ -595,6 +596,9 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        cred_inject: None,
+        echo: false,
+        trust_check: None,
     }
 }
 
