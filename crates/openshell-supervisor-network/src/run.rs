@@ -267,6 +267,7 @@ pub async fn run_networking(
         )
         .await?;
 
+        let trust_cache = Arc::new(crate::trust::TrustCache::new(Duration::from_secs(3600)));
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
@@ -279,6 +280,7 @@ pub async fn run_networking(
             Some(policy_local_ctx.clone()),
             denial_tx,
             activity_tx,
+            trust_cache,
         )
         .await?;
         Some(proxy_handle)

@@ -18,3 +18,4 @@ pub mod proxy;
 pub mod run;
 mod spiffe_endpoint;
 mod token_grant;
+pub mod trust;
