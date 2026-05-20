@@ -90,6 +90,7 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -1880,7 +1881,7 @@ network_policies:
 
     #[test]
     fn allowed_secrets_round_trips_through_proto() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   github_only:
@@ -1891,7 +1892,7 @@ network_policies:
         port: 443
     allowed_secrets:
       - GITHUB_TOKEN
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let rule = &proto.network_policies["github_only"];
         assert_eq!(rule.allowed_secrets, vec!["GITHUB_TOKEN"]);
@@ -1906,7 +1907,7 @@ network_policies:
 
     #[test]
     fn cred_inject_round_trips_through_proto() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   anthropic_strict:
@@ -1922,7 +1923,7 @@ network_policies:
           inject:
             - header: x-api-key
               from_credential: ANTHROPIC_API_KEY
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let ep = &proto.network_policies["anthropic_strict"].endpoints[0];
 
@@ -1957,7 +1958,7 @@ network_policies:
 
     #[test]
     fn trust_check_round_trips_through_proto() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   pip:
@@ -1968,7 +1969,7 @@ network_policies:
         enforcement: enforce
         trust_check:
           registry: pypi
-"#;
+";
         let policy = parse_sandbox_policy(yaml).unwrap();
         let ep = &policy.network_policies["pip"].endpoints[0];
         let tc = ep.trust_check.as_ref().expect("trust_check should be set");
