@@ -4209,6 +4209,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -4313,6 +4314,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
@@ -4421,6 +4423,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let submit_one = || {
             let state = state.clone();
@@ -4521,6 +4524,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -4825,6 +4829,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 
@@ -4853,6 +4858,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 

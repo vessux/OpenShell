@@ -3991,6 +3991,7 @@ mod tests {
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            echo: false,
         }
     }
 
@@ -4120,6 +4121,10 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4285,6 +4290,10 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4325,6 +4334,10 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
