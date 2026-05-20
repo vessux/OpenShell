@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live network access"]
     async fn classify_advisories_live_urllib3() {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))

@@ -366,7 +366,7 @@ where
 fn apply_cred_inject_or_default(
     rewritten: Vec<u8>,
     cred_inject: Option<&crate::l7::CredInjectConfig>,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
     error_tag: &str,
 ) -> Result<Vec<u8>> {
     let Some(ci) = cred_inject else {
@@ -375,7 +375,7 @@ fn apply_cred_inject_or_default(
     if ci.strip_headers.is_empty() && ci.inject.is_empty() {
         return Ok(rewritten);
     }
-    let empty_resolver = crate::secrets::SecretResolver::default();
+    let empty_resolver = SecretResolver::default();
     let r = resolver.unwrap_or(&empty_resolver);
     crate::secrets::apply_cred_inject(&rewritten, &ci.strip_headers, &ci.inject, r)
         .map_err(|e| miette!("{error_tag}cred_inject failed: {e}"))
@@ -2021,7 +2021,7 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 pub(crate) async fn echo_http_request<C>(
     req: &L7Request,
     client: &mut C,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
     cred_inject: Option<&crate::l7::CredInjectConfig>,
     policy_name: &str,
 ) -> Result<RelayOutcome>
@@ -5143,7 +5143,7 @@ mod tests {
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);
@@ -5186,7 +5186,7 @@ mod tests {
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);

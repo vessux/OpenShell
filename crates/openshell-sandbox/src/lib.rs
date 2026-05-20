@@ -28,7 +28,6 @@ mod ssh;
 mod supervisor_session;
 pub(crate) mod trust;
 
-use arc_swap::ArcSwapOption;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;

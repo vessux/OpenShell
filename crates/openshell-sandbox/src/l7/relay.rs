@@ -1515,6 +1515,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         let request = L7RequestInfo {
             action: "WEBSOCKET_TEXT".into(),
@@ -1523,7 +1527,7 @@ network_policies:
             graphql: None,
         };
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
 
         assert!(!allowed);
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
@@ -1561,6 +1565,7 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            echo: false,
         }];
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
@@ -1570,6 +1575,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1661,6 +1670,7 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            echo: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
@@ -1674,6 +1684,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1778,6 +1792,7 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: true,
+            echo: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("T".to_string(), "real-token".to_string())).collect(),
@@ -1791,6 +1806,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);

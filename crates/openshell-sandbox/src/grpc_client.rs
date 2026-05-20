@@ -801,22 +801,6 @@ impl CachedOpenShellClient {
         Ok(())
     }
 
-    /// Fetch provider environment variables for a sandbox (reuses cached connection).
-    pub async fn fetch_provider_environment(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<HashMap<String, String>> {
-        let response = self
-            .client
-            .clone()
-            .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
-                sandbox_id: sandbox_id.to_string(),
-            })
-            .await
-            .into_diagnostic()?;
-
-        Ok(response.into_inner().environment)
-    }
 }
 
 /// Fetch the resolved inference route bundle from the server.
