@@ -245,8 +245,17 @@ impl ProxyHandle {
                         let tc = trust_cache.clone();
                         tokio::spawn(async move {
                             if let Err(err) = Box::pin(handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, policy_local, gw, resolver,
-                                dtx, tc,
+                                stream,
+                                opa,
+                                cache,
+                                spid,
+                                tls,
+                                inf,
+                                policy_local,
+                                gw,
+                                resolver,
+                                dtx,
+                                tc,
                             ))
                             .await
                             {

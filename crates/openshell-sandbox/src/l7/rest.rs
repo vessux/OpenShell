@@ -465,8 +465,12 @@ where
     let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    let final_header =
-        apply_cred_inject_or_default(rewrite_result.rewritten, options.cred_inject, options.resolver, "")?;
+    let final_header = apply_cred_inject_or_default(
+        rewrite_result.rewritten,
+        options.cred_inject,
+        options.resolver,
+        "",
+    )?;
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -488,10 +492,7 @@ where
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else {
-        upstream
-            .write_all(&final_header)
-            .await
-            .into_diagnostic()?;
+        upstream.write_all(&final_header).await.into_diagnostic()?;
 
         let overflow = &req.raw_header[header_end..];
         if !overflow.is_empty() {
