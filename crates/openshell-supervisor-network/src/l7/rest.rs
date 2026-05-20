@@ -5186,7 +5186,7 @@ mod tests {
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);
@@ -5229,7 +5229,7 @@ mod tests {
 
         drop(client_write);
         let mut response_buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut response_buf)
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&response_buf[..n]);

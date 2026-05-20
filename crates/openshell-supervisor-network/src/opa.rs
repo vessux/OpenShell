@@ -2762,6 +2762,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -2819,6 +2820,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {

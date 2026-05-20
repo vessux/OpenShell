@@ -1829,6 +1829,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             }),
             ..Default::default()
         };
@@ -1853,6 +1854,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         }
     }
 
@@ -1916,6 +1918,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 }));
             })
         };
