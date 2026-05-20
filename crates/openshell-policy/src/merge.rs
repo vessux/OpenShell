@@ -1272,6 +1272,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let merged = merge_policy(
@@ -1295,6 +1296,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         // Merge an *unrelated* rule for a different host. The proposed rule
@@ -1325,6 +1327,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1337,6 +1340,7 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1368,6 +1372,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         // Endpoint exists in the policy but with a *different* binary. The
@@ -1383,6 +1388,7 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1419,6 +1425,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1438,6 +1445,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1465,6 +1473,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1487,6 +1496,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1510,6 +1520,7 @@ mod tests {
                 path: "/usr/bin/git".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let merged = merge_policy(
@@ -1534,6 +1545,7 @@ mod tests {
             name: "any_binary_rule".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1546,6 +1558,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
