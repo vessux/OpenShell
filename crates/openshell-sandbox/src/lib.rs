@@ -2538,7 +2538,6 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     }
 }
 
-
 /// Extract a bool value from an effective setting, if present.
 fn extract_bool_setting(
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
