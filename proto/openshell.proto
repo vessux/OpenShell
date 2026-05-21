@@ -277,6 +277,16 @@ message SandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Bind-mount entries: live host-path passthrough into the sandbox.
+  repeated BindVolume volumes = 11;
+}
+
+// A bind-mounted volume from the host into the sandbox.
+// Equivalent to a `podman -v HOST:CONTAINER[:ro]` argument.
+message BindVolume {
+  string host_path = 1;
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

@@ -908,7 +908,7 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+fn build_binds(config: &DockerDriverRuntimeConfig, sandbox: &DriverSandbox) -> Vec<String> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
         config.supervisor_bin.display(),
@@ -922,6 +922,15 @@ fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
             TLS_CERT_MOUNT_PATH
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
+    }
+    if let Some(spec) = sandbox.spec.as_ref() {
+        for v in &spec.volumes {
+            if v.read_only {
+                binds.push(format!("{}:{}:ro", v.host_path, v.container_path));
+            } else {
+                binds.push(format!("{}:{}", v.host_path, v.container_path));
+            }
+        }
     }
     binds
 }
@@ -1042,7 +1051,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(config)),
+            binds: Some(build_binds(config, sandbox)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

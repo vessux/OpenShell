@@ -90,6 +90,16 @@ message DriverSandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Bind-mount entries: live host-path passthrough into the sandbox.
+  repeated BindVolume volumes = 11;
+}
+
+// A bind-mounted volume from the host into the sandbox.
+// Mirrors openshell.v1.BindVolume; server maps between them.
+message BindVolume {
+  string host_path = 1;
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
