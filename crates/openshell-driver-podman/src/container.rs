@@ -119,6 +119,8 @@ struct ContainerSpec {
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userns: Option<UserNamespace>,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -198,6 +200,14 @@ struct MemoryLimits {
 #[derive(Serialize)]
 struct NetNS {
     nsmode: String,
+}
+
+/// libpod `Namespace` entry for `userns`.
+#[derive(Serialize)]
+struct UserNamespace {
+    nsmode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    value: String,
 }
 
 #[derive(Serialize)]
@@ -364,7 +374,11 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
 
 /// Build the Podman container creation JSON spec.
 #[must_use]
-pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
+pub fn build_container_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    image_sandbox_user: Option<(u32, u32)>,
+) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -381,7 +395,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     let mut networks = BTreeMap::new();
     networks.insert(config.network_name.clone(), NetworkAttachment {});
 
-    let container_spec = ContainerSpec {
+    let mut container_spec = ContainerSpec {
         name,
         image: image.to_string(),
         labels,
@@ -573,7 +587,31 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             container_port: openshell_core::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
+        userns: None,
     };
+
+    // Bind mounts requested via the CLI's --volume flag.
+    if let Some(spec) = sandbox.spec.as_ref() {
+        for v in &spec.volumes {
+            let mut options = vec!["rbind".to_string()];
+            if v.read_only {
+                options.push("ro".into());
+            }
+            container_spec.mounts.push(Mount {
+                kind: "bind".into(),
+                source: v.host_path.clone(),
+                destination: v.container_path.clone(),
+                options,
+            });
+        }
+        if !spec.volumes.is_empty() {
+            let (uid, gid) = image_sandbox_user.unwrap_or((1_000_660_000, 1_000_660_000));
+            container_spec.userns = Some(UserNamespace {
+                nsmode: "keep-id".into(),
+                value: format!("uid={uid},gid={gid}"),
+            });
+        }
+    }
 
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
 }
@@ -688,7 +726,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert_eq!(
             spec["resource_limits"]["cpu"]["quota"].as_u64(),
@@ -723,7 +761,7 @@ mod tests {
     fn container_spec_omits_devices_without_gpu_request() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert!(spec.get("devices").is_none());
     }
@@ -739,7 +777,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
@@ -758,7 +796,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
@@ -770,7 +808,7 @@ mod tests {
     fn container_spec_includes_required_capabilities() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let added: Vec<&str> = spec["cap_add"]
             .as_array()
@@ -818,7 +856,7 @@ mod tests {
     fn container_spec_sets_sandbox_name_in_env() {
         let sandbox = test_sandbox("test-id", "my-sandbox");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -833,7 +871,7 @@ mod tests {
     fn container_spec_sets_ssh_socket_path_in_env() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -848,7 +886,7 @@ mod tests {
     fn container_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let healthcheck = spec["healthconfig"]["test"]
             .as_array()
@@ -885,7 +923,7 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
 
@@ -933,7 +971,7 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let labels = spec["labels"]
             .as_object()
@@ -963,7 +1001,7 @@ mod tests {
     fn container_spec_injects_host_aliases() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()
@@ -1022,7 +1060,7 @@ mod tests {
     fn container_spec_includes_supervisor_image_volume() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let image_volumes = spec["image_volumes"]
             .as_array()
@@ -1059,7 +1097,7 @@ mod tests {
         config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
         config.guest_tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         // Verify TLS env vars are set.
         let env_map = spec["env"].as_object().expect("env should be an object");
@@ -1120,7 +1158,7 @@ mod tests {
         let sandbox = test_sandbox("notls-id", "notls-name");
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert!(
@@ -1136,5 +1174,91 @@ mod tests {
             .filter(|m| m["type"].as_str() == Some("bind"))
             .count();
         assert_eq!(bind_count, 0, "no bind mounts without TLS config");
+    }
+
+    #[test]
+    fn build_container_spec_emits_bind_mount_entries() {
+        let mut sandbox = test_sandbox("id-1", "name-1");
+        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+            volumes: vec![
+                openshell_core::proto::compute::v1::BindVolume {
+                    host_path: "/host/a".into(),
+                    container_path: "/container/a".into(),
+                    read_only: false,
+                },
+                openshell_core::proto::compute::v1::BindVolume {
+                    host_path: "/host/b".into(),
+                    container_path: "/container/b".into(),
+                    read_only: true,
+                },
+            ],
+            ..Default::default()
+        });
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, None);
+        let mounts = spec_value
+            .get("mounts")
+            .and_then(|v| v.as_array())
+            .expect("mounts array");
+        let bind_mounts: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.get("type").and_then(|t| t.as_str()) == Some("bind"))
+            .collect();
+        assert_eq!(bind_mounts.len(), 2, "expected exactly 2 bind mounts");
+        assert_eq!(
+            bind_mounts[0]
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "/host/a"
+        );
+        assert_eq!(
+            bind_mounts[0]
+                .get("destination")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "/container/a"
+        );
+        let opts: Vec<&str> = bind_mounts[1]
+            .get("options")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.as_str())
+            .collect();
+        assert!(opts.contains(&"rbind"));
+        assert!(opts.contains(&"ro"));
+    }
+
+    #[test]
+    fn build_container_spec_sets_userns_keep_id_when_volumes_present() {
+        let mut sandbox = test_sandbox("id-1", "name-1");
+        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+            volumes: vec![openshell_core::proto::compute::v1::BindVolume {
+                host_path: "/host".into(),
+                container_path: "/container".into(),
+                read_only: false,
+            }],
+            ..Default::default()
+        });
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, Some((1_000_660_000, 1_000_660_000)));
+        let userns = spec_value.get("userns").expect("userns set");
+        assert_eq!(
+            userns.get("nsmode").and_then(|v| v.as_str()).unwrap(),
+            "keep-id"
+        );
+        assert_eq!(
+            userns.get("value").and_then(|v| v.as_str()).unwrap(),
+            "uid=1000660000,gid=1000660000"
+        );
+    }
+
+    #[test]
+    fn build_container_spec_omits_userns_when_no_volumes() {
+        let sandbox = test_sandbox("id-1", "name-1");
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, None);
+        assert!(spec_value.get("userns").is_none() || spec_value.get("userns").unwrap().is_null());
     }
 }

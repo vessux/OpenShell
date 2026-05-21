@@ -580,6 +580,31 @@ impl PodmanClient {
         Ok(())
     }
 
+    /// Inspect an image and return its USER directive parsed as (uid, gid).
+    ///
+    /// Returns `Ok((1_000_660_000, 1_000_660_000))` if USER is unset or
+    /// non-numeric (community-image convention for the rootless sandbox UID).
+    pub async fn image_user(&self, image_ref: &str) -> Result<(u32, u32), PodmanApiError> {
+        let path = format!("/libpod/images/{}/json", url_encode(image_ref));
+        let v: Value = self
+            .request_json(hyper::Method::GET, &path, None::<&Value>)
+            .await?;
+        let user = v
+            .pointer("/Config/User")
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        if user.is_empty() {
+            return Ok((1_000_660_000, 1_000_660_000));
+        }
+        let parts: Vec<&str> = user.split(':').collect();
+        let uid: u32 = parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_660_000);
+        let gid: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(uid);
+        Ok((uid, gid))
+    }
+
     // ── System operations ────────────────────────────────────────────────
 
     /// Ping the Podman API to verify connectivity.
