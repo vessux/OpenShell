@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_cli::volume_spec;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -2501,7 +2502,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
-                    volumes: _volumes,
+                    volumes,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2547,6 +2548,13 @@ async fn main() -> Result<()> {
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
+                    // Parse --volume specs into BindVolumeSpec entries.
+                    let parsed_volumes = volumes
+                        .iter()
+                        .map(|s| volume_spec::parse_volume_spec(s))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| miette::miette!("{}", e))?;
+
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
@@ -2570,6 +2578,7 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &parsed_volumes,
                         &tls,
                     ))
                     .await?;

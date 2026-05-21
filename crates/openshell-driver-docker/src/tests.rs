@@ -33,6 +33,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            volumes: vec![],
         }),
         status: None,
     }
