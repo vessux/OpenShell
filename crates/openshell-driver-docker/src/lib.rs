@@ -1989,6 +1989,15 @@ fn build_binds(
             SANDBOX_TOKEN_MOUNT_PATH
         ));
     }
+    if let Some(spec) = sandbox.spec.as_ref() {
+        for v in &spec.volumes {
+            if v.read_only {
+                binds.push(format!("{}:{}:ro", v.host_path, v.container_path));
+            } else {
+                binds.push(format!("{}:{}", v.host_path, v.container_path));
+            }
+        }
+    }
     Ok(binds)
 }
 

@@ -327,6 +327,17 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Bind-mount entries: live host-path passthrough into the sandbox.
+  // Fork-added field; uses the 9000+ range reserved for openlock additions.
+  repeated BindVolume volumes = 9003;
+}
+
+// A bind-mounted volume from the host into the sandbox.
+// Equivalent to a `podman -v HOST:CONTAINER[:ro]` argument.
+message BindVolume {
+  string host_path = 1;
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

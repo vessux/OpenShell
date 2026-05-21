@@ -89,6 +89,24 @@ Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
 
+## User Bind Volumes
+
+Sandboxes accept `--volume <HOST>:<CONTAINER>[:ro]` at creation time. The host
+path must be absolute and exist; the container path must be absolute. The
+optional `:ro` suffix makes the bind read-only.
+
+On rootless Podman, the driver inspects the sandbox image's `Config.User`
+directive and sets the libpod `userns` field to `keep-id` with the image uid.
+This maps the container sandbox uid bidirectionally to the host caller's uid so
+bind files are mutually readable and writable across the namespace boundary
+without manual ownership changes. The `userns` override is applied only when at
+least one `--volume` is present; sandboxes without bind volumes continue to use
+the default rootless mapping.
+
+Docker and Kubernetes do not receive automatic userns remapping from the driver.
+Docker rootless requires daemon-wide `userns-remap` configuration. Kubernetes
+bind volumes follow cluster storage and security context policies.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images
