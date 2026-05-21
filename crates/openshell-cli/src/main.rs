@@ -1126,6 +1126,7 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // Create variant holds many clap fields by design
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1233,6 +1234,21 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Bind-mount a host path into the sandbox.
+        ///
+        /// Format: `<HOST_PATH>:<CONTAINER_PATH>[:ro]`. Repeatable.
+        /// Host path must be absolute and exist. Container path must be
+        /// absolute. The optional `:ro` suffix makes the mount read-only.
+        ///
+        /// On rootless podman, the driver auto-applies
+        /// `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>`
+        /// when any `--volume` is set, so bind file ownership maps
+        /// bidirectionally between host and container.
+        ///
+        /// Not supported on the vm driver.
+        #[arg(long = "volume", help_heading = "MOUNT FLAGS")]
+        volumes: Vec<String>,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
@@ -2483,6 +2499,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    volumes: _volumes,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
