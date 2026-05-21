@@ -5,22 +5,37 @@
 //!
 //! These tests run the compiled `openshell` binary and inspect exit codes / help
 //! output — no gRPC server required.
+//!
+//! # Why subprocess instead of in-process
+//!
+//! `Cli` is a private type in `main.rs`, so `Cli::command()` / `Cli::try_parse_from`
+//! cannot be called from tests. The public `run::sandbox_create` entry point accepts
+//! already-parsed arguments, so calling it directly would bypass clap entirely. The
+//! lifecycle integration test (`sandbox_create_lifecycle_integration.rs`) tests the
+//! *runtime* path and requires a full mock gRPC+TLS server — that infrastructure is
+//! out of scope for a pure parse-acceptance check.
+//!
+//! We therefore retain the subprocess approach. With `HOME` and `XDG_CONFIG_HOME`
+//! pointing to an empty temp directory, no gateway is configured, so the binary
+//! immediately exits with code 1 ("No active gateway") before any network I/O.
+//! A clap parse failure exits with code 2; the test asserts the exact value is 1.
 
 use std::process::Command;
 
-fn openshell_bin() -> String {
-    // Cargo sets CARGO_BIN_EXE_<binary-name> for integration tests in the same
-    // crate. Fall back to a cargo-run invocation for environments where the
-    // pre-built binary is not cached.
-    std::env::var("CARGO_BIN_EXE_openshell")
-        .unwrap_or_else(|_| "cargo run -p openshell-cli --".to_string())
+/// Canonical path to the compiled `openshell` binary.
+///
+/// `CARGO_BIN_EXE_openshell` is set by Cargo for every integration test in the
+/// same crate. Using `env!` fails at compile time rather than silently falling
+/// back to a broken runtime path.
+fn openshell_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_openshell")
 }
 
 /// Assert that `--volume` appears in `sandbox create --help`.
 #[test]
 fn volume_flag_appears_in_help() {
     let bin = openshell_bin();
-    let output = Command::new(&bin)
+    let output = Command::new(bin)
         .args(["sandbox", "create", "--help"])
         .output()
         .unwrap_or_else(|_| panic!("failed to run {bin}"));
@@ -33,16 +48,16 @@ fn volume_flag_appears_in_help() {
     );
 }
 
-/// Passing `--volume /host:/container` must be accepted (exit 0 up to the
-/// gateway connection attempt; before any gateway is reachable the command
-/// exits non-zero due to connection failure, but the argument must at least
-/// parse without a clap error).
+/// Passing `--volume /host:/container` must be accepted by clap.
 ///
-/// We detect a clap parse error (exit code 2) vs a runtime error (exit != 2).
+/// With no gateway configured (empty HOME / XDG_CONFIG_HOME) the binary exits
+/// with code 1 ("No active gateway") before any network I/O. A clap parse
+/// failure would produce exit code 2. We assert the exact code is 1 to confirm
+/// clap accepted the flag and only the runtime path failed.
 #[test]
 fn volume_flag_two_field_spec_parses() {
     let bin = openshell_bin();
-    let output = Command::new(&bin)
+    let output = Command::new(bin)
         .args([
             "sandbox",
             "create",
@@ -51,16 +66,18 @@ fn volume_flag_two_field_spec_parses() {
             "--volume",
             "/host:/container",
         ])
-        .env("OPENSHELL_ENDPOINT", "https://127.0.0.1:1") // unreachable → runtime error, not clap error
         .env("XDG_CONFIG_HOME", std::env::temp_dir().to_str().unwrap())
         .env("HOME", std::env::temp_dir().to_str().unwrap())
         .output()
         .unwrap_or_else(|_| panic!("failed to run {bin}"));
 
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "--volume /host:/container should not produce a clap parse error (exit 2);\nstdout: {}\nstderr: {}",
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(1),
+        "--volume /host:/container should fail with exit 1 (no gateway configured), \
+         not 2 (clap parse error) or 0 (unexpected success); \
+         got exit {exit_code:?}\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -70,7 +87,7 @@ fn volume_flag_two_field_spec_parses() {
 #[test]
 fn volume_flag_three_field_ro_spec_parses() {
     let bin = openshell_bin();
-    let output = Command::new(&bin)
+    let output = Command::new(bin)
         .args([
             "sandbox",
             "create",
@@ -79,16 +96,18 @@ fn volume_flag_three_field_ro_spec_parses() {
             "--volume",
             "/host:/container:ro",
         ])
-        .env("OPENSHELL_ENDPOINT", "https://127.0.0.1:1")
         .env("XDG_CONFIG_HOME", std::env::temp_dir().to_str().unwrap())
         .env("HOME", std::env::temp_dir().to_str().unwrap())
         .output()
         .unwrap_or_else(|_| panic!("failed to run {bin}"));
 
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "--volume /host:/container:ro should not produce a clap parse error (exit 2);\nstdout: {}\nstderr: {}",
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(1),
+        "--volume /host:/container:ro should fail with exit 1 (no gateway configured), \
+         not 2 (clap parse error) or 0 (unexpected success); \
+         got exit {exit_code:?}\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -98,20 +117,22 @@ fn volume_flag_three_field_ro_spec_parses() {
 #[test]
 fn volume_flag_repeats() {
     let bin = openshell_bin();
-    let output = Command::new(&bin)
+    let output = Command::new(bin)
         .args([
             "sandbox", "create", "--from", "python", "--volume", "/a:/b", "--volume", "/c:/d:ro",
         ])
-        .env("OPENSHELL_ENDPOINT", "https://127.0.0.1:1")
         .env("XDG_CONFIG_HOME", std::env::temp_dir().to_str().unwrap())
         .env("HOME", std::env::temp_dir().to_str().unwrap())
         .output()
         .unwrap_or_else(|_| panic!("failed to run {bin}"));
 
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "repeated --volume flags should not produce a clap parse error (exit 2);\nstdout: {}\nstderr: {}",
+    let exit_code = output.status.code();
+    assert_eq!(
+        exit_code,
+        Some(1),
+        "repeated --volume flags should fail with exit 1 (no gateway configured), \
+         not 2 (clap parse error) or 0 (unexpected success); \
+         got exit {exit_code:?}\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

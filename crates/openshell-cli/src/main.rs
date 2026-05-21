@@ -1126,7 +1126,9 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
-#[allow(clippy::large_enum_variant)] // Create variant holds many clap fields by design
+// Create variant is 297 bytes (vs next-largest 78 bytes) because it holds every clap field for
+// `sandbox create`. Boxing would scatter heap allocations across command startup for no benefit.
+#[allow(clippy::large_enum_variant)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
