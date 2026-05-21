@@ -20,6 +20,12 @@ use tracing::debug;
 /// Podman libpod API version prefix.
 const API_VERSION: &str = "v5.0.0";
 
+/// Default sandbox user UID for the openshell community sandbox images.
+/// Used as the userns-remap target when an image's `Config.User` is unset
+/// or non-numeric. Source: examples/bring-your-own-container/Dockerfile
+/// uses `useradd -m -u 1000660000 -g sandbox sandbox`.
+pub const COMMUNITY_SANDBOX_UID: u32 = 1_000_660_000;
+
 /// Timeout for individual Podman API calls.
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -582,8 +588,21 @@ impl PodmanClient {
 
     /// Inspect an image and return its USER directive parsed as (uid, gid).
     ///
-    /// Returns `Ok((1_000_660_000, 1_000_660_000))` if USER is unset or
-    /// non-numeric (community-image convention for the rootless sandbox UID).
+    /// Parsing rules:
+    ///
+    /// - `""` (unset USER): returns the community-sandbox fallback
+    ///   `(COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID)`.
+    /// - `"uid"` or `"uid:gid"`: parses both fields as `u32`. If the uid
+    ///   field is missing or non-numeric (e.g. `"sandbox"` or `":1000"`),
+    ///   returns the community-sandbox fallback immediately — the gid field
+    ///   is not examined, preventing a mismatched `(fallback_uid, 1000)` pair.
+    /// - `"0"` (root): returns `(0, 0)`. The resulting `keep-id:uid=0,gid=0`
+    ///   directive is harmless on rootless Podman because the host caller uid
+    ///   already maps to container uid 0 by default; the userns just makes
+    ///   the mapping explicit.
+    /// - Non-numeric (e.g. `"sandbox"`): returns the community-sandbox
+    ///   fallback. Image authors using name-style USER are expected to align
+    ///   the numeric uid with the community convention.
     pub async fn image_user(&self, image_ref: &str) -> Result<(u32, u32), PodmanApiError> {
         let path = format!("/libpod/images/{}/json", url_encode(image_ref));
         let v: Value = self
@@ -594,13 +613,12 @@ impl PodmanClient {
             .and_then(|u| u.as_str())
             .unwrap_or("");
         if user.is_empty() {
-            return Ok((1_000_660_000, 1_000_660_000));
+            return Ok((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
         }
         let parts: Vec<&str> = user.split(':').collect();
-        let uid: u32 = parts
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1_000_660_000);
+        let Some(uid) = parts.first().and_then(|s| s.parse::<u32>().ok()) else {
+            return Ok((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
+        };
         let gid: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(uid);
         Ok((uid, gid))
     }

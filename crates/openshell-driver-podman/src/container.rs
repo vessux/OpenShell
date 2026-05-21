@@ -3,6 +3,7 @@
 
 //! Container spec construction for the Podman driver.
 
+use crate::client::COMMUNITY_SANDBOX_UID;
 use crate::config::PodmanComputeConfig;
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::DriverSandbox;
@@ -605,7 +606,8 @@ pub fn build_container_spec(
             });
         }
         if !spec.volumes.is_empty() {
-            let (uid, gid) = image_sandbox_user.unwrap_or((1_000_660_000, 1_000_660_000));
+            let (uid, gid) =
+                image_sandbox_user.unwrap_or((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
             container_spec.userns = Some(UserNamespace {
                 nsmode: "keep-id".into(),
                 value: format!("uid={uid},gid={gid}"),
@@ -1219,6 +1221,15 @@ mod tests {
                 .unwrap(),
             "/container/a"
         );
+        let opts0: Vec<&str> = bind_mounts[0]
+            .get("options")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.as_str())
+            .collect();
+        assert!(opts0.contains(&"rbind"));
+        assert!(!opts0.contains(&"ro")); // first mount is read-write
         let opts: Vec<&str> = bind_mounts[1]
             .get("options")
             .and_then(|v| v.as_array())
