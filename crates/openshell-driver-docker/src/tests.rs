@@ -423,7 +423,7 @@ fn build_environment_keeps_path_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&runtime_config(), &test_sandbox());
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -437,6 +437,28 @@ fn build_binds_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_binds_emits_user_volume_entries() {
+    let mut sandbox = test_sandbox();
+    if let Some(spec) = sandbox.spec.as_mut() {
+        spec.volumes = vec![
+            openshell_core::proto::compute::v1::BindVolume {
+                host_path: "/host/a".into(),
+                container_path: "/container/a".into(),
+                read_only: false,
+            },
+            openshell_core::proto::compute::v1::BindVolume {
+                host_path: "/host/b".into(),
+                container_path: "/container/b".into(),
+                read_only: true,
+            },
+        ];
+    }
+    let binds = build_binds(&runtime_config(), &sandbox);
+    assert!(binds.contains(&"/host/a:/container/a".to_string()));
+    assert!(binds.contains(&"/host/b:/container/b:ro".to_string()));
 }
 
 #[test]
