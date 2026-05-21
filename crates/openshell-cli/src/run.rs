@@ -8,6 +8,7 @@ use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
     grpc_inference_client, require_tls_materials,
 };
+use crate::volume_spec::BindVolumeSpec;
 use bytes::Bytes;
 use chrono::DateTime;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
@@ -32,7 +33,7 @@ use openshell_core::progress::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
+    BindVolume, ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
     DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
@@ -1680,6 +1681,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    volumes: &[BindVolumeSpec],
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1751,6 +1753,15 @@ pub async fn sandbox_create(
         None
     };
 
+    let proto_volumes: Vec<BindVolume> = volumes
+        .iter()
+        .map(|v| BindVolume {
+            host_path: v.host.clone(),
+            container_path: v.container.clone(),
+            read_only: v.read_only,
+        })
+        .collect();
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
@@ -1758,6 +1769,7 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
+            volumes: proto_volumes,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),

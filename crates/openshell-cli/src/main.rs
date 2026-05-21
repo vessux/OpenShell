@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_cli::volume_spec;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -1148,6 +1149,9 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+// Create variant is 297 bytes (vs next-largest 78 bytes) because it holds every clap field for
+// `sandbox create`. Boxing would scatter heap allocations across command startup for no benefit.
+#[allow(clippy::large_enum_variant)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1255,6 +1259,21 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Bind-mount a host path into the sandbox.
+        ///
+        /// Format: `<HOST_PATH>:<CONTAINER_PATH>[:ro]`. Repeatable.
+        /// Host path must be absolute and exist. Container path must be
+        /// absolute. The optional `:ro` suffix makes the mount read-only.
+        ///
+        /// On rootless podman, the driver auto-applies
+        /// `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>`
+        /// when any `--volume` is set, so bind file ownership maps
+        /// bidirectionally between host and container.
+        ///
+        /// Not supported on the vm driver.
+        #[arg(long = "volume", help_heading = "MOUNT FLAGS")]
+        volumes: Vec<String>,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
@@ -2526,6 +2545,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    volumes,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2571,6 +2591,13 @@ async fn main() -> Result<()> {
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
+                    // Parse --volume specs into BindVolumeSpec entries.
+                    let parsed_volumes = volumes
+                        .iter()
+                        .map(|s| volume_spec::parse_volume_spec(s))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| miette::miette!("{}", e))?;
+
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
@@ -2594,6 +2621,7 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &parsed_volumes,
                         &tls,
                     ))
                     .await?;

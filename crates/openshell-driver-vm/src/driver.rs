@@ -2594,6 +2594,12 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         return Err(Status::invalid_argument("gpu_device requires gpu=true"));
     }
 
+    if !spec.volumes.is_empty() {
+        return Err(Status::invalid_argument(
+            "bind mounts not supported on vm driver; remove --volume flags or use podman/docker driver",
+        ));
+    }
+
     if let Some(template) = spec.template.as_ref() {
         if !template.agent_socket_path.is_empty() {
             return Err(Status::failed_precondition(
@@ -4608,6 +4614,28 @@ mod tests {
         };
         validate_vm_sandbox(&sandbox, false)
             .expect("template.resources should be accepted and ignored");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_bind_volumes() {
+        use openshell_core::proto::compute::v1::BindVolume;
+
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                volumes: vec![BindVolume {
+                    host_path: "/host/data".into(),
+                    container_path: "/data".into(),
+                    read_only: false,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_vm_sandbox(&sandbox, false)
+            .expect_err("volumes should be rejected by vm driver");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("not supported on vm driver"));
     }
 
     #[test]

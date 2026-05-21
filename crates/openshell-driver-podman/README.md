@@ -325,6 +325,29 @@ matter compared to cluster or rootful runtimes:
 8. tmpfs at `/run/netns`: a private tmpfs lets the supervisor create named
    network namespaces via `ip netns add`.
 
+## Bind Volumes (`--volume`)
+
+`openshell sandbox create --volume <HOST>:<CONTAINER>[:ro]` passes
+through to podman's `-v` flag at libpod-spec construction. The host
+path must be absolute and exist; the container path must be absolute.
+The optional `:ro` suffix makes the bind read-only.
+
+When any `--volume` is present on rootless podman, the driver:
+
+1. Inspects the sandbox image's `Config.User` directive via libpod
+   `/images/{name}/json`. The directive is parsed as `uid` or
+   `uid:gid`; empty or non-numeric values fall back to the
+   community-image default of `(1000660000, 1000660000)`.
+2. Sets the libpod `userns` field to
+   `{ nsmode: "keep-id", value: "uid=N,gid=N" }`. This maps the
+   container sandbox uid bidirectionally to the host caller's uid,
+   so bind files are mutually readable + writable across the
+   boundary.
+
+When no `--volume` is present the driver leaves `userns` unset
+(libpod default mapping), preserving prior behaviour for copy-only
+sandboxes.
+
 ## Implementation References
 
 - Gateway integration: `crates/openshell-server/src/compute/mod.rs`

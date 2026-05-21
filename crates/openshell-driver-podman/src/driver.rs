@@ -363,10 +363,17 @@ impl PodmanComputeDriver {
         };
 
         // 3. Create container.
+        let image_sandbox_user = if sandbox.spec.as_ref().is_some_and(|s| !s.volumes.is_empty()) {
+            let image_ref = container::resolve_image(sandbox, &self.config);
+            Some(self.client.image_user(image_ref).await?)
+        } else {
+            None
+        };
         let spec = container::build_container_spec_with_token(
             sandbox,
             &self.config,
             token_host_path.as_deref(),
+            image_sandbox_user,
         );
         match self.client.create_container(&spec).await {
             Ok(_) => {}

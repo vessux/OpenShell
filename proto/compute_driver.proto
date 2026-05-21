@@ -97,6 +97,16 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
+  // Bind-mount entries: live host-path passthrough into the sandbox.
+  repeated BindVolume volumes = 12;
+}
+
+// A bind-mounted volume from the host into the sandbox.
+// Mirrors openshell.v1.BindVolume; server maps between them.
+message BindVolume {
+  string host_path = 1;
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
