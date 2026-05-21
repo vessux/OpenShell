@@ -50,7 +50,7 @@ fn volume_flag_appears_in_help() {
 
 /// Passing `--volume /host:/container` must be accepted by clap.
 ///
-/// With no gateway configured (empty HOME / XDG_CONFIG_HOME) the binary exits
+/// With no gateway configured (empty HOME / `XDG_CONFIG_HOME`) the binary exits
 /// with code 1 ("No active gateway") before any network I/O. A clap parse
 /// failure would produce exit code 2. We assert the exact code is 1 to confirm
 /// clap accepted the flag and only the runtime path failed.
