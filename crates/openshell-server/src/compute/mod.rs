@@ -248,6 +248,12 @@ impl fmt::Debug for ComputeRuntime {
     }
 }
 
+/// Label stamped onto a Sandbox's metadata by `stop_sandbox` and cleared by
+/// `start_sandbox`. When the label is present and the watch loop derives
+/// `Error` (because the container exited), the phase is overridden to
+/// `Stopped` so callers can distinguish a user-requested halt from a crash.
+const STOP_REQUESTED_LABEL: &str = "openshell.io/stop-requested";
+
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
@@ -561,7 +567,9 @@ impl ComputeRuntime {
 
     /// Stop the compute resource backing a sandbox without removing the
     /// sandbox record. Workspace volume and provider links survive. Phase
-    /// is left to the watch loop to update as the backend transitions.
+    /// is left to the watch loop to update as the backend transitions —
+    /// but the runtime stamps a `stop-requested` label first so the watch
+    /// loop maps the ensuing `ContainerExited` to `Stopped`, not `Error`.
     /// Idempotent: a missing or already-stopped backend resource is not
     /// an error.
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), Status> {
@@ -574,6 +582,20 @@ impl ComputeRuntime {
         let Some(sandbox) = sandbox else {
             return Err(Status::not_found("sandbox not found"));
         };
+
+        let _ = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |s| {
+                if let Some(metadata) = s.metadata.as_mut() {
+                    metadata
+                        .labels
+                        .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+                }
+            })
+            .await
+            .map_err(|e| {
+                warn!(sandbox_name = %name, error = %e, "Failed to stamp stop-requested label");
+            });
 
         let driver_sandbox = driver_sandbox_from_public(&sandbox);
         self.driver
@@ -607,10 +629,26 @@ impl ComputeRuntime {
             ));
         };
 
-        resume
+        let started = resume
             .resume_sandbox(sandbox.object_id(), sandbox.object_name())
             .await
-            .map_err(|err| Status::internal(format!("start sandbox failed: {err}")))
+            .map_err(|err| Status::internal(format!("start sandbox failed: {err}")))?;
+
+        if started {
+            let _ = self
+                .store
+                .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |s| {
+                    if let Some(metadata) = s.metadata.as_mut() {
+                        metadata.labels.remove(STOP_REQUESTED_LABEL);
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    warn!(sandbox_name = %name, error = %e, "Failed to clear stop-requested label");
+                });
+        }
+
+        Ok(started)
     }
 
     pub fn spawn_watchers(&self) {
@@ -990,6 +1028,14 @@ impl ComputeRuntime {
                     phase = SandboxPhase::Ready;
                 }
 
+                // Distinguish user-requested stop from a crash: when `stop_sandbox`
+                // stamped the stop-requested label, treat the container's terminal
+                // exit as `Stopped` rather than `Error`. The label is cleared by
+                // `start_sandbox` on a successful resume.
+                if phase == SandboxPhase::Error && sandbox_has_stop_requested_label(sandbox) {
+                    phase = SandboxPhase::Stopped;
+                }
+
                 let old_phase =
                     SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
                 if old_phase != phase {
@@ -1068,8 +1114,12 @@ impl ComputeRuntime {
                 let current_phase =
                     SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
 
-                // Skip if sandbox is in terminal state
-                if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+                // Skip if sandbox is in terminal state. Stopped is intentional;
+                // a stale supervisor session event must not silently reanimate it.
+                if matches!(
+                    current_phase,
+                    SandboxPhase::Deleting | SandboxPhase::Error | SandboxPhase::Stopped
+                ) {
                     return;
                 }
 
@@ -1625,6 +1675,13 @@ fn public_platform_event_from_driver(event: &DriverPlatformEvent) -> PlatformEve
         message: event.message.clone(),
         metadata: event.metadata.clone(),
     }
+}
+
+fn sandbox_has_stop_requested_label(sandbox: &Sandbox) -> bool {
+    sandbox
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.labels.get(STOP_REQUESTED_LABEL).map(String::as_str) == Some("true"))
 }
 
 fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
@@ -2379,6 +2436,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_sandbox_update_maps_error_to_stopped_when_stop_requested() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "ContainerExited",
+                    "Container has exited",
+                ))),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Stopped,
+            "watch loop must surface intentional stop as Stopped, not Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_keeps_error_when_stop_label_absent() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "ContainerExited",
+                    "Container crashed",
+                ))),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Error,
+            "absent stop-requested label must keep the crash signal as Error"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -2901,6 +3030,96 @@ mod tests {
             .stop_sandbox("live")
             .await
             .expect("stop_sandbox should succeed");
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_stamps_stop_requested_label() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .stop_sandbox("live")
+            .await
+            .expect("stop_sandbox should succeed");
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sandbox_has_stop_requested_label(&stored),
+            "stop_sandbox must stamp the stop-requested label so the watch loop maps ContainerExited→Stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_clears_stop_requested_label_on_success() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(true)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let mut sandbox = sandbox_record("sb-1", "live", SandboxPhase::Stopped);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("live")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(started);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !sandbox_has_stop_requested_label(&stored),
+            "start_sandbox must clear the stop-requested label on successful resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_preserves_stop_requested_label_when_backend_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(false)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let mut sandbox = sandbox_record("sb-1", "ghost", SandboxPhase::Stopped);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("ghost")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(!started);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sandbox_has_stop_requested_label(&stored),
+            "label must persist when resume hook reports backend missing — sandbox is still stopped"
+        );
     }
 
     #[tokio::test]
