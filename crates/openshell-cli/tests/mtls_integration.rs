@@ -102,6 +102,22 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::StopSandboxResponse>, Status> {
+        Ok(Response::new(openshell_core::proto::StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::StartSandboxResponse>, Status> {
+        Ok(Response::new(openshell_core::proto::StartSandboxResponse {
+            started: true,
+        }))
+    }
+
     async fn get_sandbox_config(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
