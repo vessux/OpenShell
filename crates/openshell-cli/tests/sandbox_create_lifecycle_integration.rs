@@ -23,7 +23,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
     SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
-    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    ServiceStatus, SettingValue, StartSandboxRequest, StartSandboxResponse, StopSandboxRequest,
+    StopSandboxResponse, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
     sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
@@ -153,6 +154,20 @@ impl OpenShell for TestOpenShell {
             .await
             .push(vec![request.name]);
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        Ok(Response::new(StartSandboxResponse { started: true }))
     }
 
     async fn get_sandbox_config(

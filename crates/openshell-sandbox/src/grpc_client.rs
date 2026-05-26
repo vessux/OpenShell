@@ -800,7 +800,6 @@ impl CachedOpenShellClient {
 
         Ok(())
     }
-
 }
 
 /// Fetch the resolved inference route bundle from the server.

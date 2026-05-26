@@ -25,7 +25,8 @@ use openshell_core::proto::{
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
     ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
+    SandboxStreamEvent, ServiceStatus, SettingValue, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest, setting_value,
 };
 use openshell_core::{ObjectId, ObjectName};
@@ -258,6 +259,20 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        Ok(Response::new(StartSandboxResponse { started: true }))
     }
 
     async fn get_sandbox_config(

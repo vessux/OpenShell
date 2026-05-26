@@ -19,7 +19,8 @@ use openshell_core::proto::compute::v1::{
     BindVolume as DriverBindVolume, CreateSandboxRequest, DeleteSandboxRequest, DriverCondition,
     DriverPlatformEvent, DriverResourceRequirements, DriverSandbox, DriverSandboxSpec,
     DriverSandboxStatus, DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
-    ListSandboxesRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    ListSandboxesRequest, StopSandboxRequest as DriverStopSandboxRequest,
+    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
@@ -81,6 +82,15 @@ trait StartupResume: Send + Sync {
 
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
+    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id, sandbox_name)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[tonic::async_trait]
+impl StartupResume for PodmanComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
             .await
@@ -381,14 +391,17 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        let inner = Arc::new(
+            PodmanComputeDriver::new(config)
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let startup_resume: Arc<dyn StartupResume> = inner.clone();
+        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new((*inner).clone()));
         Self::from_driver(
             driver,
             None,
-            None,
+            Some(startup_resume),
             None,
             store,
             sandbox_index,
@@ -553,6 +566,60 @@ impl ComputeRuntime {
 
         self.cleanup_sandbox_state(&id);
         Ok(deleted)
+    }
+
+    /// Stop the compute resource backing a sandbox without removing the
+    /// sandbox record. Workspace volume and provider links survive. Phase
+    /// is left to the watch loop to update as the backend transitions.
+    /// Idempotent: a missing or already-stopped backend resource is not
+    /// an error.
+    pub async fn stop_sandbox(&self, name: &str) -> Result<(), Status> {
+        let sandbox = self
+            .store
+            .get_message_by_name::<Sandbox>(name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+        let Some(sandbox) = sandbox else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+
+        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        self.driver
+            .stop_sandbox(Request::new(DriverStopSandboxRequest {
+                sandbox_id: driver_sandbox.id,
+                sandbox_name: driver_sandbox.name,
+            }))
+            .await
+            .map(|_| ())
+            .map_err(|err| Status::internal(format!("stop sandbox failed: {}", err.message())))
+    }
+
+    /// Start a previously-stopped sandbox backend resource. Idempotent:
+    /// an already-running container returns success. Returns
+    /// `Ok(false)` when the record exists but the backend resource is
+    /// missing — caller should surface this so the user can recreate.
+    pub async fn start_sandbox(&self, name: &str) -> Result<bool, Status> {
+        let sandbox = self
+            .store
+            .get_message_by_name::<Sandbox>(name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+        let Some(sandbox) = sandbox else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+
+        let Some(resume) = &self.startup_resume else {
+            return Err(Status::unimplemented(
+                "start sandbox not supported by configured compute driver",
+            ));
+        };
+
+        resume
+            .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+            .await
+            .map_err(|err| Status::internal(format!("start sandbox failed: {err}")))
     }
 
     pub fn spawn_watchers(&self) {
@@ -2832,6 +2899,91 @@ mod tests {
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_returns_not_found_when_sandbox_missing() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let err = runtime
+            .stop_sandbox("does-not-exist")
+            .await
+            .expect_err("missing sandbox should fail");
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_succeeds_for_existing_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .stop_sandbox("live")
+            .await
+            .expect("stop_sandbox should succeed");
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_returns_not_found_when_sandbox_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let err = runtime
+            .start_sandbox("does-not-exist")
+            .await
+            .expect_err("missing sandbox should fail");
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(
+            resume.calls().await.is_empty(),
+            "resume should not be called when sandbox record is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_returns_unimplemented_without_resume_hook() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let err = runtime
+            .start_sandbox("live")
+            .await
+            .expect_err("start without resume hook should fail");
+        assert_eq!(err.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_forwards_to_resume_hook() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(true)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("live")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(started);
+        assert_eq!(
+            resume.calls().await,
+            vec![("sb-1".to_string(), "live".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_reports_false_when_backend_resource_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(false)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let sandbox = sandbox_record("sb-1", "ghost", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("ghost")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(!started);
     }
 
     #[test]

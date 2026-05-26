@@ -64,6 +64,8 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     // sandbox:write
     ("/openshell.v1.OpenShell/CreateSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/DeleteSandbox", "sandbox:write"),
+    ("/openshell.v1.OpenShell/StopSandbox", "sandbox:write"),
+    ("/openshell.v1.OpenShell/StartSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/ExecSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/ForwardTcp", "sandbox:write"),
     ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
