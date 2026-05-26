@@ -340,7 +340,8 @@ message SandboxSpec {
   reserved 11;
   reserved "proposal_approval_mode";
   // Bind-mount entries: live host-path passthrough into the sandbox.
-  // Fork-added field; uses the 9000+ range reserved for openlock additions.
+  // Fork-added field; uses the 9000+ range reserved for openlock additions
+  // to stay clear of upstream's sequential numbering.
   repeated BindVolume volumes = 9003;
 }
 
@@ -431,7 +432,9 @@ enum SandboxPhase {
   // Compute backend is intentionally stopped (explicit Stop RPC). Distinct
   // from Error so reattach paths and external clients can tell a user-
   // requested halt from a crash. Cleared by the Start RPC.
-  SANDBOX_PHASE_STOPPED = 6;
+  // Fork-added value; uses the 9000+ range reserved for openlock additions
+  // so upstream can keep extending the enum sequentially without colliding.
+  SANDBOX_PHASE_STOPPED = 9004;
 }
 
 // Public platform event exposed on the sandbox watch stream.
