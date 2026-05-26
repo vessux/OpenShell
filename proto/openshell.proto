@@ -428,6 +428,10 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  // Compute backend is intentionally stopped (explicit Stop RPC). Distinct
+  // from Error so reattach paths and external clients can tell a user-
+  // requested halt from a crash. Cleared by the Start RPC.
+  SANDBOX_PHASE_STOPPED = 6;
 }
 
 // Public platform event exposed on the sandbox watch stream.
