@@ -98,7 +98,10 @@ message DriverSandboxSpec {
   // Sandbox proto.
   string sandbox_token = 11;
   // Bind-mount entries: live host-path passthrough into the sandbox.
-  repeated BindVolume volumes = 12;
+  // Fork-added field; uses the 9000+ range reserved for openlock additions
+  // (mirrors openshell.v1.SandboxSpec.volumes) to stay clear of upstream's
+  // sequential numbering — upstream's sandbox_token took the old field 11.
+  repeated BindVolume volumes = 9003;
 }
 
 // A bind-mounted volume from the host into the sandbox.

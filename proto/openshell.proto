@@ -335,7 +335,9 @@ message SandboxSpec {
   // first available GPU.
   string gpu_device = 10;
   // Bind-mount entries: live host-path passthrough into the sandbox.
-  repeated BindVolume volumes = 11;
+  // Fork-added field; uses the 9000+ range reserved for openlock additions
+  // to stay clear of upstream's sequential numbering.
+  repeated BindVolume volumes = 9003;
 }
 
 // A bind-mounted volume from the host into the sandbox.
@@ -417,7 +419,9 @@ enum SandboxPhase {
   // Compute backend is intentionally stopped (explicit Stop RPC). Distinct
   // from Error so reattach paths and external clients can tell a user-
   // requested halt from a crash. Cleared by the Start RPC.
-  SANDBOX_PHASE_STOPPED = 6;
+  // Fork-added value; uses the 9000+ range reserved for openlock additions
+  // so upstream can keep extending the enum sequentially without colliding.
+  SANDBOX_PHASE_STOPPED = 9004;
 }
 
 // Public platform event exposed on the sandbox watch stream.
