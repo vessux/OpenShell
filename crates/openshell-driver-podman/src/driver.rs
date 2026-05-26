@@ -585,6 +585,33 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)
     }
 
+    /// Start a previously-stopped sandbox container. Idempotent: returns
+    /// `Ok(true)` when the container is already running. Returns
+    /// `Ok(false)` when no managed container exists for the sandbox so
+    /// the caller can surface the gap.
+    pub async fn resume_sandbox(
+        &self,
+        _sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, ComputeDriverError> {
+        let name = validated_container_name(sandbox_name)?;
+        info!(sandbox_name = %sandbox_name, container = %name, "Starting sandbox container");
+
+        let inspect = match self.client.inspect_container(&name).await {
+            Ok(i) => i,
+            Err(PodmanApiError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(ComputeDriverError::from(e)),
+        };
+        if inspect.state.running {
+            return Ok(true);
+        }
+        match self.client.start_container(&name).await {
+            Ok(()) => Ok(true),
+            Err(PodmanApiError::NotFound(_)) => Ok(false),
+            Err(e) => Err(ComputeDriverError::from(e)),
+        }
+    }
+
     /// Delete a sandbox container and its workspace volume.
     pub async fn delete_sandbox(
         &self,
@@ -1480,5 +1507,131 @@ mod tests {
             )]
         );
         let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn resume_sandbox_returns_false_when_container_missing() {
+        let sandbox_name = "demo";
+        let container_name = container::container_name(sandbox_name);
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "resume-not-found",
+            vec![StubResponse::new(
+                StatusCode::NOT_FOUND,
+                r#"{"message":"gone"}"#,
+            )],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        let started = driver
+            .resume_sandbox("sandbox-id", sandbox_name)
+            .await
+            .expect("resume should succeed");
+
+        assert!(!started, "missing container should report started=false");
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            vec![format!(
+                "GET {}",
+                api_path(&format!("/libpod/containers/{container_name}/json"))
+            )]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn resume_sandbox_is_noop_when_already_running() {
+        let sandbox_name = "demo";
+        let container_name = container::container_name(sandbox_name);
+        let inspect_body = serde_json::json!({
+            "Id": "container-id",
+            "Name": format!("/{container_name}"),
+            "State": {
+                "Status": "running",
+                "Running": true
+            },
+            "Config": { "Labels": {} }
+        })
+        .to_string();
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "resume-running",
+            vec![StubResponse::new(StatusCode::OK, inspect_body)],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        let started = driver
+            .resume_sandbox("sandbox-id", sandbox_name)
+            .await
+            .expect("resume should succeed");
+
+        assert!(started, "running container should report started=true");
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            vec![format!(
+                "GET {}",
+                api_path(&format!("/libpod/containers/{container_name}/json"))
+            )],
+            "no start request should be issued for already-running container"
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn resume_sandbox_starts_stopped_container() {
+        let sandbox_name = "demo";
+        let container_name = container::container_name(sandbox_name);
+        let inspect_body = serde_json::json!({
+            "Id": "container-id",
+            "Name": format!("/{container_name}"),
+            "State": {
+                "Status": "exited",
+                "Running": false
+            },
+            "Config": { "Labels": {} }
+        })
+        .to_string();
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "resume-stopped",
+            vec![
+                StubResponse::new(StatusCode::OK, inspect_body),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        let started = driver
+            .resume_sandbox("sandbox-id", sandbox_name)
+            .await
+            .expect("resume should succeed");
+
+        assert!(started, "stopped container should report started=true");
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            vec![
+                format!(
+                    "GET {}",
+                    api_path(&format!("/libpod/containers/{container_name}/json"))
+                ),
+                format!(
+                    "POST {}",
+                    api_path(&format!("/libpod/containers/{container_name}/start"))
+                ),
+            ]
+        );
+        let _ = std::fs::remove_file(socket_path);
     }
 }
