@@ -147,7 +147,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install build deps
-        run: brew install protobuf
+        run: brew install protobuf z3
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -162,17 +162,14 @@ jobs:
       - name: Build openshell-gateway
         run: cargo build --release --target "$TARGET" -p openshell-server
 
-      # CLI links z3; --features bundled-z3 vendors and statically links it
-      # from source. macOS already uses libc++ as the default C++ runtime, so
-      # no CXXSTDLIB override or zig toolchain is needed (Apple clang builds
-      # the vendored z3 directly). The released binary has no runtime z3 dep.
+      # Use system z3 from Homebrew on macOS. bundled-z3 vendors an older z3
+      # source whose obj_hashtable.h hits clang overload-resolution errors on
+      # macos-14's Apple clang (only the Linux release needs static z3 — fresh
+      # Linux boxes lack libz3.so.4; macOS dev hosts have Homebrew z3).
       - name: Build openshell CLI
         env:
-          # z3-sys --features bundled fetches the z3 source via the GitHub API;
-          # authenticate so GitHub-hosted runners don't hit the unauthenticated
-          # 60-req/hr rate limit (HTTP 403). z3-sys reads READ_ONLY_GITHUB_TOKEN.
-          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
-        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
+          Z3_SYS_Z3_HEADER: /opt/homebrew/include/z3.h
+        run: cargo build --release --target "$TARGET" -p openshell-cli
 
       - name: Package binaries
         run: |
