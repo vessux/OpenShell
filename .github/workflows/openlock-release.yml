@@ -147,12 +147,42 @@ jobs:
           fetch-depth: 0
 
       - name: Install build deps
-        run: brew install protobuf z3
+        run: brew install protobuf
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      # The CLI statically links z3 via --features bundled-z3 (no runtime libz3
+      # dylib). The vendored z3 source hits overload-resolution errors under the
+      # runner's older Apple clang, so — mirroring the Linux job and upstream
+      # release-dev.yml — zig provides the C/C++ compiler for the z3 build. zig
+      # only COMPILES z3 (built static); the final binary is linked by the
+      # default system linker (ld64), because zig cannot link a macOS
+      # executable. Only the CLI build step opts in (via its env:); the gateway
+      # doesn't link z3 and keeps the default toolchain.
+      - name: Set up zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Configure zig C/C++ wrappers for z3
+        run: |
+          set -euo pipefail
+          ZIG="$(command -v zig)"
+          mkdir -p /tmp/zig-cc
+
+          # cc-rs injects --target=<rust-triple>, which zig does not parse;
+          # strip it and let zig use its native default. -fno-sanitize=all
+          # disables zig cc's default UBSan instrumentation, whose
+          # __ubsan_handle_* symbols are otherwise unresolved when the system
+          # linker links the final Rust binary.
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s -fno-sanitize=all "${args[@]}"\n' \
+              "$ZIG" "$tool" > "/tmp/zig-cc/${tool}"
+            chmod +x "/tmp/zig-cc/${tool}"
+          done
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@v2
@@ -162,14 +192,26 @@ jobs:
       - name: Build openshell-gateway
         run: cargo build --release --target "$TARGET" -p openshell-server
 
-      # Use system z3 from Homebrew on macOS. bundled-z3 vendors an older z3
-      # source whose obj_hashtable.h hits clang overload-resolution errors on
-      # macos-14's Apple clang (only the Linux release needs static z3 — fresh
-      # Linux boxes lack libz3.so.4; macOS dev hosts have Homebrew z3).
+      # --features bundled-z3 vendors and statically links z3 via the zig
+      # toolchain configured above, so the released binary has no runtime libz3
+      # dylib and works on a clean Mac with no Homebrew z3. CC/CXX and the
+      # target-scoped CC_<triple>/CXX_<triple> point cc-rs (z3-sys's builder) at
+      # the zig wrappers; CXXSTDLIB=c++ matches macOS's libc++. The linker is
+      # deliberately NOT overridden — zig cannot link a macOS executable, so
+      # ld64 links the final binary against the zig-compiled static z3.
       - name: Build openshell CLI
         env:
-          Z3_SYS_Z3_HEADER: /opt/homebrew/include/z3.h
-        run: cargo build --release --target "$TARGET" -p openshell-cli
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CC_aarch64_apple_darwin: /tmp/zig-cc/cc
+          CXX_aarch64_apple_darwin: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          # z3-sys --features bundled fetches the z3 source via the GitHub API;
+          # authenticate so the runner doesn't hit the unauthenticated
+          # 60-req/hr rate limit (HTTP 403). z3-sys reads READ_ONLY_GITHUB_TOKEN.
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
 
       - name: Package binaries
         run: |
