@@ -53,10 +53,36 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libssl-dev clang protobuf-compiler libz3-dev
+          sudo apt-get install -y -qq pkg-config libssl-dev clang protobuf-compiler
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # The CLI statically links z3 via --features bundled-z3 (no runtime
+      # libz3.so.4). The vendored z3 source hits overload-resolution errors
+      # under modern system clang, so — mirroring upstream release-dev.yml —
+      # zig provides the C/C++ toolchain and linker for the z3 build. Only the
+      # CLI build step opts into this (via that step's env:); the gateway and
+      # sandbox supervisor don't link z3 and keep the default toolchain.
+      - name: Set up zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Configure zig C/C++ wrappers for z3
+        run: |
+          set -euo pipefail
+          ZIG="$(command -v zig)"
+          mkdir -p /tmp/zig-cc
+
+          # cc-rs injects --target=<rust-triple> (for example
+          # x86_64-unknown-linux-gnu), which zig does not parse. Strip any
+          # caller-provided --target and let zig use its native default.
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s "${args[@]}"\n' \
+              "$ZIG" "$tool" > "/tmp/zig-cc/${tool}"
+            chmod +x "/tmp/zig-cc/${tool}"
+          done
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@v2
@@ -69,10 +95,24 @@ jobs:
       - name: Build openshell-sandbox (supervisor)
         run: cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
 
-      # Use system libz3-dev. Same reason as macOS: bundled-z3's vendored
-      # source hits modern-clang overload-resolution errors.
+      # CLI links z3; --features bundled-z3 vendors and statically links it
+      # via the zig toolchain configured above, so the released binary has no
+      # runtime libz3.so.4 dependency. The CC/CXX/LINKER and CXXSTDLIB=c++
+      # overrides are scoped to this step (z3 built with zig c++ uses libc++
+      # symbols, so z3-sys's default stdc++ must be overridden to match).
       - name: Build openshell CLI
-        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli
+        env:
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+        run: |
+          set -euo pipefail
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          TARGET_ENV_UPPER=${TARGET_ENV^^}
+          export "CC_${TARGET_ENV}=/tmp/zig-cc/cc"
+          export "CXX_${TARGET_ENV}=/tmp/zig-cc/c++"
+          export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-cc/cc"
+          cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
 
       - name: Package binaries
         run: |
@@ -103,7 +143,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install build deps
-        run: brew install protobuf z3
+        run: brew install protobuf
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -118,13 +158,12 @@ jobs:
       - name: Build openshell-gateway
         run: cargo build --release --target "$TARGET" -p openshell-server
 
-      # Use system z3 from Homebrew. Bundled-z3 vendors an older z3 source
-      # whose obj_hashtable.h hits clang overload-resolution errors on
-      # macos-14's Apple clang.
+      # CLI links z3; --features bundled-z3 vendors and statically links it
+      # from source. macOS already uses libc++ as the default C++ runtime, so
+      # no CXXSTDLIB override or zig toolchain is needed (Apple clang builds
+      # the vendored z3 directly). The released binary has no runtime z3 dep.
       - name: Build openshell CLI
-        env:
-          Z3_SYS_Z3_HEADER: /opt/homebrew/include/z3.h
-        run: cargo build --release --target "$TARGET" -p openshell-cli
+        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
 
       - name: Package binaries
         run: |
