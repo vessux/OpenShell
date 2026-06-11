@@ -105,6 +105,10 @@ jobs:
           CC: /tmp/zig-cc/cc
           CXX: /tmp/zig-cc/c++
           CXXSTDLIB: c++
+          # z3-sys --features bundled fetches the z3 source via the GitHub API;
+          # authenticate so GitHub-hosted runners don't hit the unauthenticated
+          # 60-req/hr rate limit (HTTP 403). z3-sys reads READ_ONLY_GITHUB_TOKEN.
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
@@ -163,6 +167,11 @@ jobs:
       # no CXXSTDLIB override or zig toolchain is needed (Apple clang builds
       # the vendored z3 directly). The released binary has no runtime z3 dep.
       - name: Build openshell CLI
+        env:
+          # z3-sys --features bundled fetches the z3 source via the GitHub API;
+          # authenticate so GitHub-hosted runners don't hit the unauthenticated
+          # 60-req/hr rate limit (HTTP 403). z3-sys reads READ_ONLY_GITHUB_TOKEN.
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
         run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
 
       - name: Package binaries
