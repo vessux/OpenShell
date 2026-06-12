@@ -188,6 +188,10 @@ message CredInjectHeader {
   // Name of the credential value to use as the header value
   // (e.g. "ANTHROPIC_API_KEY").
   string from_credential = 2;
+  // openlock fork delta: literal prefix prepended to the resolved credential
+  // value when composing the injected header (e.g. "Bearer "). Lets cred_inject
+  // emit `Authorization: Bearer <token>` from a raw stored token.
+  string value_prefix = 3;
 }
 
 // Trust check configuration for package registry endpoints.

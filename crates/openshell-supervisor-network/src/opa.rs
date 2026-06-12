@@ -1199,6 +1199,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 serde_json::json!({
                                     "header": h.header,
                                     "from_credential": h.from_credential,
+                                    "value_prefix": h.value_prefix,
                                 })
                             })
                             .collect();

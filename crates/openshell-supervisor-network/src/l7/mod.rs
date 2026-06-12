@@ -311,9 +311,12 @@ fn get_inject_array(val: &regorus::Value, key: &str) -> Vec<openshell_core::secr
             .filter_map(|item| {
                 let header = get_object_str(item, "header")?;
                 let from_credential = get_object_str(item, "from_credential")?;
+                // Absent/empty prefix = no prefix (back-compat).
+                let value_prefix = get_object_str(item, "value_prefix").unwrap_or_default();
                 Some(openshell_core::secrets::CredInjectDirective {
                     header,
                     from_credential,
+                    value_prefix,
                 })
             })
             .collect(),

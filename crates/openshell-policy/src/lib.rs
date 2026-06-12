@@ -168,6 +168,10 @@ struct CredInjectDef {
 struct CredInjectHeaderDef {
     header: String,
     from_credential: String,
+    // openlock fork delta: literal prefix prepended to the resolved credential
+    // value (e.g. "Bearer "). Optional — empty/absent = no prefix (back-compat).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    value_prefix: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -395,6 +399,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     .map(|h| CredInjectHeader {
                                         header: h.header,
                                         from_credential: h.from_credential,
+                                        value_prefix: h.value_prefix,
                                     })
                                     .collect(),
                             }),
@@ -577,6 +582,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     .map(|h| CredInjectHeaderDef {
                                         header: h.header.clone(),
                                         from_credential: h.from_credential.clone(),
+                                        value_prefix: h.value_prefix.clone(),
                                     })
                                     .collect(),
                             }),

@@ -5167,6 +5167,7 @@ mod tests {
             inject: vec![openshell_core::secrets::CredInjectDirective {
                 header: "x-api-key".to_string(),
                 from_credential: "ANTHROPIC_API_KEY".to_string(),
+                value_prefix: String::new(),
             }],
         };
 
