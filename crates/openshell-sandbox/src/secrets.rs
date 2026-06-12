@@ -81,6 +81,10 @@ pub struct RewriteResult {
 pub struct CredInjectDirective {
     pub header: String,
     pub from_credential: String,
+    /// Literal prefix prepended to the resolved credential value when composing
+    /// the injected header (e.g. `"Bearer "`). Empty string = no prefix
+    /// (back-compat for directives that store a pre-prefixed value).
+    pub value_prefix: String,
 }
 
 /// Result of rewriting a request target for OPA evaluation.
@@ -1096,14 +1100,14 @@ pub fn apply_cred_inject(
     };
 
     // Pre-resolve all inject directives up front (fail-closed).
-    let mut resolved_injections: Vec<(&str, &str)> = Vec::with_capacity(inject.len());
+    let mut resolved_injections: Vec<(&str, &str, &str)> = Vec::with_capacity(inject.len());
     for directive in inject {
         let value = resolver
             .resolve_by_env_key(&directive.from_credential)
             .ok_or(UnresolvedPlaceholderError {
                 location: "cred_inject",
             })?;
-        resolved_injections.push((&directive.header, value));
+        resolved_injections.push((&directive.header, &directive.value_prefix, value));
     }
 
     let mut output = Vec::with_capacity(raw.len() + inject.len() * 64);
@@ -1128,10 +1132,12 @@ pub fn apply_cred_inject(
         output.extend_from_slice(b"\r\n");
     }
 
-    // Append injected headers.
-    for (header, value) in &resolved_injections {
+    // Append injected headers. The value_prefix (e.g. "Bearer ") is prepended
+    // to the resolved credential value; an empty prefix is a no-op (back-compat).
+    for (header, value_prefix, value) in &resolved_injections {
         output.extend_from_slice(header.as_bytes());
         output.extend_from_slice(b": ");
+        output.extend_from_slice(value_prefix.as_bytes());
         output.extend_from_slice(value.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
@@ -1210,6 +1216,41 @@ mod tests {
                 &resolver,
             ),
             "Authorization: Bearer sk-test"
+        );
+    }
+
+    #[test]
+    fn cred_inject_applies_value_prefix() {
+        // Provider stores a RAW token (no "Bearer " prefix). cred_inject must
+        // prepend the literal prefix when composing the injected header so that
+        // `Authorization: Bearer <token>` is emitted from a raw stored token.
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_BEARER_TOKEN".to_string(),
+                "sk-ant-oat01-REAL".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let inject = vec![CredInjectDirective {
+            header: "Authorization".to_string(),
+            from_credential: "ANTHROPIC_BEARER_TOKEN".to_string(),
+            value_prefix: "Bearer ".to_string(),
+        }];
+
+        let out = apply_cred_inject(
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            &["Authorization".to_string()],
+            &inject,
+            &resolver,
+        )
+        .expect("should succeed");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("Authorization: Bearer sk-ant-oat01-REAL"),
+            "got: {text}"
         );
     }
 
@@ -2274,6 +2315,7 @@ mod tests {
         let inject = vec![CredInjectDirective {
             header: "x-api-key".to_string(),
             from_credential: "ANTHROPIC_API_KEY".to_string(),
+            value_prefix: String::new(),
         }];
 
         let result =
@@ -2332,6 +2374,7 @@ mod tests {
         let inject = vec![CredInjectDirective {
             header: "x-api-key".to_string(),
             from_credential: "NONEXISTENT_KEY".to_string(),
+            value_prefix: String::new(),
         }];
 
         let result = apply_cred_inject(raw, &[], &inject, &resolver);
@@ -2378,6 +2421,7 @@ mod tests {
         let inject = vec![CredInjectDirective {
             header: "x-api-key".into(),
             from_credential: "ANTHROPIC_API_KEY".into(),
+            value_prefix: String::new(),
         }];
         let result = apply_cred_inject(raw, &[], &inject, &gh_resolver);
         assert!(result.is_err(), "gh should not resolve ANTHROPIC_API_KEY");
@@ -2386,6 +2430,7 @@ mod tests {
         let inject_github = vec![CredInjectDirective {
             header: "Authorization".into(),
             from_credential: "GITHUB_TOKEN".into(),
+            value_prefix: String::new(),
         }];
         let result = apply_cred_inject(raw, &[], &inject_github, &gh_resolver);
         assert!(result.is_ok());
@@ -2422,6 +2467,7 @@ mod tests {
         let inject = vec![CredInjectDirective {
             header: "x-api-key".into(),
             from_credential: "ANTHROPIC_API_KEY".into(),
+            value_prefix: String::new(),
         }];
         let final_result =
             apply_cred_inject(&rewrite_result.rewritten, &strip, &inject, &resolver).unwrap();

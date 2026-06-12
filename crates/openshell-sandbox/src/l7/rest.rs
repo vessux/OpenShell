@@ -5124,6 +5124,7 @@ mod tests {
             inject: vec![crate::secrets::CredInjectDirective {
                 header: "x-api-key".to_string(),
                 from_credential: "ANTHROPIC_API_KEY".to_string(),
+                value_prefix: String::new(),
             }],
         };
 
