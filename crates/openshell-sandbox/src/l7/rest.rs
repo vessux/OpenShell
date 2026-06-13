@@ -472,6 +472,19 @@ where
         "",
     )?;
 
+    // Egress observability (DEBUG-gated, OFF by default): surface the
+    // billing-relevant request header `anthropic-beta` (carries
+    // `oauth-2025-04-20` in Claude subscription mode) for testing. The
+    // `enabled!` guard avoids parsing the header block when debug is off.
+    // NEVER logs Authorization / any credential header — only `anthropic-beta`.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for line in String::from_utf8_lossy(&final_header).lines().skip(1) {
+            if line.to_ascii_lowercase().starts_with("anthropic-beta:") {
+                debug!(header = %line.trim(), "l7 egress request header");
+            }
+        }
+    }
+
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
     }
@@ -1638,6 +1651,24 @@ where
         overflow_bytes = buf.len() - header_end,
         "relay_response framing"
     );
+
+    // Egress observability (DEBUG-gated, OFF by default): surface the
+    // subscription billing-bucket response headers for testing — `overage-status`,
+    // `unified-5h-status`, `unified-7d-status`, `representative-claim`, and the
+    // `anthropic-ratelimit-*` family. These are non-secret routing/quota signals.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for line in header_str.lines().skip(1) {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("overage-status:")
+                || lower.starts_with("unified-5h-status:")
+                || lower.starts_with("unified-7d-status:")
+                || lower.starts_with("representative-claim:")
+                || lower.starts_with("anthropic-ratelimit-")
+            {
+                debug!(status_code, header = %line.trim(), "l7 egress response header");
+            }
+        }
+    }
 
     // 101 Switching Protocols: the connection has been upgraded (e.g. to
     // WebSocket).  Forward the 101 headers to the client and signal the
