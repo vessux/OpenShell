@@ -480,7 +480,9 @@ where
     if tracing::enabled!(tracing::Level::DEBUG) {
         for line in String::from_utf8_lossy(&final_header).lines().skip(1) {
             if line.to_ascii_lowercase().starts_with("anthropic-beta:") {
-                debug!(header = %line.trim(), "l7 egress request header");
+                // Embed the value in the message (not a structured field) so it
+                // renders in the shorthand log that `openlock logs` surfaces.
+                debug!("l7 egress request header | {}", line.trim());
             }
         }
     }
@@ -1665,7 +1667,9 @@ where
                 || lower.starts_with("representative-claim:")
                 || lower.starts_with("anthropic-ratelimit-")
             {
-                debug!(status_code, header = %line.trim(), "l7 egress response header");
+                // Embed status + value in the message (not structured fields) so
+                // they render in the shorthand log that `openlock logs` surfaces.
+                debug!("l7 egress response header [{}] | {}", status_code, line.trim());
             }
         }
     }
