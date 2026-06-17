@@ -194,6 +194,20 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
+/// Effective log level for the rolling file layer. Always at least `info`
+/// (so the OCSF L7 audit lines are always present), but follows the
+/// configured level when it is more verbose — so `--log-level debug`
+/// surfaces the debug-gated L7 egress headers in the file that
+/// `openlock logs` tails. Keyed off the supervisor's `--log-level`
+/// (`OPENSHELL_LOG_LEVEL`); RUST_LOG-only activation reaches the console
+/// layer but not the file, which is acceptable for our activation path.
+fn file_log_level(configured: &str) -> &str {
+    match configured.to_ascii_lowercase().as_str() {
+        "debug" | "trace" => configured,
+        _ => "info",
+    }
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -274,7 +288,7 @@ fn main() -> Result<()> {
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
         let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let file_filter = EnvFilter::new("info");
+            let file_filter = EnvFilter::new(file_log_level(&args.log_level));
 
             // OCSF JSONL file: rolling appender matching the main log file
             // (daily rotation, 3 files max). Created eagerly but gated by the
@@ -368,6 +382,20 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn file_log_level_floors_at_info_and_follows_verbose() {
+        // Below/at info → pinned to info so the file always carries OCSF lines.
+        assert_eq!(file_log_level("warn"), "info");
+        assert_eq!(file_log_level("info"), "info");
+        assert_eq!(file_log_level("error"), "info");
+        // Debug/trace → follow the configured level so debug-gated L7 egress
+        // headers reach the file `openlock logs` reads.
+        assert_eq!(file_log_level("debug"), "debug");
+        assert_eq!(file_log_level("trace"), "trace");
+        // Case-insensitive match; returns the original spelling.
+        assert_eq!(file_log_level("DEBUG"), "DEBUG");
+    }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.

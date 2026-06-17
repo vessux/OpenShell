@@ -1770,6 +1770,7 @@ pub async fn sandbox_create(
     environment: &HashMap<String, String>,
     approval_mode: &str,
     volumes: &[BindVolumeSpec],
+    log_level: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1862,6 +1863,7 @@ pub async fn sandbox_create(
             providers: configured_providers,
             template,
             volumes: proto_volumes,
+            log_level: log_level.unwrap_or_default().to_string(),
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
