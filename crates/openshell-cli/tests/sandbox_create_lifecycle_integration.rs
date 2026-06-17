@@ -812,6 +812,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -854,6 +855,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -931,6 +933,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -988,6 +991,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1041,6 +1045,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1086,6 +1091,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1127,6 +1133,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1172,6 +1179,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1217,6 +1225,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
@@ -1262,6 +1271,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some(false),
         &HashMap::new(),
         &[],
+        None,
         &tls,
     )
     .await
