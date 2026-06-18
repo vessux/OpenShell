@@ -935,6 +935,8 @@ async fn sandbox_create_sends_driver_config_json() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
+        None,
         &tls,
     )
     .await
@@ -1405,6 +1407,8 @@ async fn sandbox_create_sends_environment_variables() {
         &HashMap::new(),
         &env_map,
         "manual",
+        &[],
+        None,
         &tls,
     )
     .await

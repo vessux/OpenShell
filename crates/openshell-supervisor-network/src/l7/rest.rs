@@ -465,8 +465,12 @@ where
     let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    let final_header =
-        apply_cred_inject_or_default(rewrite_result.rewritten, options.cred_inject, options.resolver, "")?;
+    let final_header = apply_cred_inject_or_default(
+        rewrite_result.rewritten,
+        options.cred_inject,
+        options.resolver,
+        "",
+    )?;
 
     // Egress observability (DEBUG-gated, OFF by default): surface the
     // billing-relevant request header `anthropic-beta` (carries
@@ -503,10 +507,7 @@ where
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else {
-        upstream
-            .write_all(&final_header)
-            .await
-            .into_diagnostic()?;
+        upstream.write_all(&final_header).await.into_diagnostic()?;
 
         let overflow = &req.raw_header[header_end..];
         if !overflow.is_empty() {
@@ -1671,7 +1672,11 @@ where
             {
                 // Embed status + value in the message (not structured fields) so
                 // they render in the shorthand log that `openlock logs` surfaces.
-                debug!("l7 egress response header [{}] | {}", status_code, line.trim());
+                debug!(
+                    "l7 egress response header [{}] | {}",
+                    status_code,
+                    line.trim()
+                );
             }
         }
     }
@@ -2152,8 +2157,8 @@ where
 mod tests {
     use super::*;
     use crate::opa::OpaEngine;
-    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use SecretResolver;
+    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use std::sync::Arc;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");

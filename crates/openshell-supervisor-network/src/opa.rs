@@ -3764,6 +3764,7 @@ process:
         network_policies.insert(
             "allow_mcp_internal_corp_example_com_8443".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "allow_mcp_internal_corp_example_com_8443".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "mcp-internal.corp.example.com".to_string(),
@@ -3813,6 +3814,7 @@ process:
         network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "internal-admin.local".to_string(),

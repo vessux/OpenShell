@@ -784,8 +784,12 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
-pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
-    try_build_container_spec_with_token(sandbox, config, None)
+pub fn build_container_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    image_sandbox_user: Option<(u32, u32)>,
+) -> Value {
+    build_container_spec_with_token_and_gpu_default(sandbox, config, None, None, image_sandbox_user)
         .expect("container spec should be valid")
 }
 
@@ -1258,7 +1262,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.sandbox_pids_limit = 0;
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
@@ -1327,8 +1331,9 @@ mod tests {
         });
         let config = test_config();
 
-        let err = build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None)
-            .unwrap_err();
+        let err =
+            build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None, None)
+                .unwrap_err();
 
         assert!(matches!(err, ComputeDriverError::Precondition(_)));
         assert!(err.to_string().contains("selected default CDI GPU device"));
@@ -1517,7 +1522,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.health_check_interval_secs = 30;
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let interval = spec["healthconfig"]["Interval"]
             .as_u64()
@@ -1591,7 +1596,7 @@ mod tests {
                     ..Default::default()
                 });
 
-                let spec = build_container_spec(&sandbox, &test_config());
+                let spec = build_container_spec(&sandbox, &test_config(), None);
                 let env_map = spec["env"].as_object().expect("env should be an object");
 
                 assert_eq!(
@@ -1815,7 +1820,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let volumes = spec["volumes"]
             .as_array()
@@ -1882,7 +1887,7 @@ mod tests {
         });
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let volumes = spec["volumes"]
             .as_array()
             .expect("volumes should be an array");
@@ -1917,7 +1922,7 @@ mod tests {
         });
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let volumes = spec["volumes"]
             .as_array()
             .expect("volumes should be an array");
@@ -1978,7 +1983,7 @@ mod tests {
         let mut config = test_config();
         config.enable_bind_mounts = true;
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
@@ -2017,7 +2022,7 @@ mod tests {
         let mut config = test_config();
         config.enable_bind_mounts = true;
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
@@ -2094,7 +2099,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.host_gateway_ip = "192.168.127.254".to_string();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()
@@ -2193,7 +2198,7 @@ mod tests {
         let config = test_config();
         let token_path = Path::new("/host/token.jwt");
 
-        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path), None);
+        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(

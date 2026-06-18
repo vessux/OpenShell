@@ -1123,6 +1123,7 @@ mod tests {
             &driver.config,
             None,
             first_device.as_deref(),
+            None,
         )
         .unwrap();
 
@@ -1136,6 +1137,7 @@ mod tests {
             &driver.config,
             None,
             second_device.as_deref(),
+            None,
         )
         .unwrap();
 
@@ -1540,7 +1542,7 @@ mod tests {
                 api_path(&format!("/libpod/containers/{container_name}/json"))
             )]
         );
-        let _ = std::fs::remove_file(socket_path);
+        let _ = fs::remove_file(socket_path);
     }
 
     #[tokio::test]
@@ -1582,7 +1584,7 @@ mod tests {
             )],
             "no start request should be issued for already-running container"
         );
-        let _ = std::fs::remove_file(socket_path);
+        let _ = fs::remove_file(socket_path);
     }
 
     #[tokio::test]
@@ -1632,6 +1634,6 @@ mod tests {
                 ),
             ]
         );
-        let _ = std::fs::remove_file(socket_path);
+        let _ = fs::remove_file(socket_path);
     }
 }

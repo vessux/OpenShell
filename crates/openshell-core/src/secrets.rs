@@ -262,6 +262,7 @@ impl SecretResolver {
     /// Create a new resolver containing only the specified credential keys.
     /// If `allowed_keys` is empty, returns a clone with all credentials
     /// (backward compatible — empty means "no restriction").
+    #[must_use]
     pub fn filtered(&self, allowed_keys: &[String]) -> Self {
         if allowed_keys.is_empty() {
             return self.clone();

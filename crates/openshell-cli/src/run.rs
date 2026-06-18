@@ -1864,7 +1864,6 @@ pub async fn sandbox_create(
             template,
             volumes: proto_volumes,
             log_level: log_level.unwrap_or_default().to_string(),
-            ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
         labels: labels.clone(),

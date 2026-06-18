@@ -301,7 +301,10 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
 }
 
 /// Extract an array of `CredInjectDirective` from a regorus object field.
-fn get_inject_array(val: &regorus::Value, key: &str) -> Vec<openshell_core::secrets::CredInjectDirective> {
+fn get_inject_array(
+    val: &regorus::Value,
+    key: &str,
+) -> Vec<openshell_core::secrets::CredInjectDirective> {
     let Some(arr_val) = get_object_val(val, key) else {
         return Vec::new();
     };

@@ -725,7 +725,8 @@ impl ComputeRuntime {
                 warn!(sandbox_name = %name, error = %e, "Failed to stamp stop-requested label");
             });
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        let driver_sandbox =
+            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
         self.driver
             .stop_sandbox(Request::new(DriverStopSandboxRequest {
                 sandbox_id: driver_sandbox.id,
@@ -2952,7 +2953,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Stopped,
             "watch loop must surface intentional stop as Stopped, not Error"
         );
@@ -2985,7 +2986,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error,
             "absent stop-requested label must keep the crash signal as Error"
         );

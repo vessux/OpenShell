@@ -1558,6 +1558,11 @@ network_policies:
             }
         };
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),
@@ -1601,6 +1606,11 @@ network_policies:
             }
         };
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),

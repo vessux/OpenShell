@@ -47,6 +47,7 @@ tonic-prost-build = { workspace = true }
 protobuf-src = { workspace = true }
 
 [dev-dependencies]
+arc-swap = "1"
 tempfile = "3"
 
 [lints]
