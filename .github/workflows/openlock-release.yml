@@ -89,8 +89,23 @@ jobs:
         with:
           shared-key: openlock-release-${{ matrix.target }}
 
+      # The gateway (openshell-server) gained an upstream prover dependency that
+      # pulls z3-sys; build it with bundled-z3 via the zig toolchain (same as the
+      # CLI) so the released gateway has no runtime libz3.so.4 dependency.
       - name: Build openshell-gateway
-        run: cargo build --release --target ${{ matrix.target }} -p openshell-server
+        env:
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          TARGET_ENV_UPPER=${TARGET_ENV^^}
+          export "CC_${TARGET_ENV}=/tmp/zig-cc/cc"
+          export "CXX_${TARGET_ENV}=/tmp/zig-cc/c++"
+          export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-cc/cc"
+          cargo build --release --target ${{ matrix.target }} -p openshell-server --features bundled-z3
 
       - name: Build openshell-sandbox (supervisor)
         run: cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
@@ -189,8 +204,19 @@ jobs:
         with:
           shared-key: openlock-release-aarch64-apple-darwin
 
+      # The gateway (openshell-server) gained an upstream prover dependency that
+      # pulls z3-sys; build it with bundled-z3 via the zig toolchain (same as the
+      # CLI) so the released gateway works on a clean Mac with no Homebrew z3.
       - name: Build openshell-gateway
-        run: cargo build --release --target "$TARGET" -p openshell-server
+        env:
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CC_aarch64_apple_darwin: /tmp/zig-cc/cc
+          CXX_aarch64_apple_darwin: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+        run: cargo build --release --target "$TARGET" -p openshell-server --features bundled-z3
 
       # --features bundled-z3 vendors and statically links z3 via the zig
       # toolchain configured above, so the released binary has no runtime libz3
