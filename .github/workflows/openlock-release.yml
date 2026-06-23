@@ -43,7 +43,11 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # The gateway now links z3 (upstream prover dep), so each job compiles z3
+    # twice (gateway + CLI). On the slower amd64 runner that exceeds 60 min;
+    # raised to 120. Follow-up: build server+cli in one cargo invocation to
+    # share z3-sys, or add sccache, to cut release wall-clock.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
         with:
