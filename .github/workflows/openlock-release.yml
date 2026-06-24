@@ -81,10 +81,18 @@ jobs:
 
           # cc-rs injects --target=<rust-triple> (for example
           # x86_64-unknown-linux-gnu), which zig does not parse. Strip any
-          # caller-provided --target and let zig use its native default.
+          # caller-provided --target. WITHOUT -target, zig cc defaults to the
+          # *runner's native* CPU, baking AVX2/BMI2/FMA into the bundled z3 —
+          # which SIGILLs on older CPUs (e.g. pre-Haswell Ivy Bridge). Pin a
+          # portable ISA baseline per arch so the released binaries run anywhere.
+          case "${{ matrix.target }}" in
+            x86_64-*)  MCPU="x86_64_v2" ;;  # SSE4.2/POPCNT, ~2008+; ample for z3
+            aarch64-*) MCPU="baseline" ;;   # armv8-a, universal aarch64
+            *)         MCPU="baseline" ;;
+          esac
           for tool in cc c++; do
-            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s "${args[@]}"\n' \
-              "$ZIG" "$tool" > "/tmp/zig-cc/${tool}"
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s -mcpu=%s "${args[@]}"\n' \
+              "$ZIG" "$tool" "$MCPU" > "/tmp/zig-cc/${tool}"
             chmod +x "/tmp/zig-cc/${tool}"
           done
 
