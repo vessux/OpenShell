@@ -1314,7 +1314,7 @@ impl ComputeRuntime {
                     );
                 }
 
-                if phase == SandboxPhase::Error
+                if is_new_error_transition(old_phase, phase)
                     && let Some(ref status) = status
                 {
                     for condition in &status.conditions {
@@ -2046,6 +2046,16 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
             | SandboxPhase::Ready
             | SandboxPhase::Unknown
     )
+}
+
+/// Whether `apply_sandbox_update_locked` should consider warning about a
+/// sandbox failing to become ready: only on the transition *into* `Error`,
+/// never on a repeated reconcile pass over a sandbox that was already
+/// `Error` (openlock-lai — an ungated warn produced ~687 identical log
+/// lines/day for one dead-but-still-listed sandbox, since the 60s reconcile
+/// sweep re-processes it forever without the phase ever changing).
+fn is_new_error_transition(old_phase: SandboxPhase, phase: SandboxPhase) -> bool {
+    old_phase != phase && phase == SandboxPhase::Error
 }
 
 fn is_terminal_failure_reason(reason: &str) -> bool {
@@ -2990,6 +3000,50 @@ mod tests {
             SandboxPhase::Error,
             "absent stop-requested label must keep the crash signal as Error"
         );
+    }
+
+    // `is_new_error_transition` gates the "Sandbox failed to become ready"
+    // warn (openlock-lai): an earlier version of this code fired that warn
+    // on every 60s reconcile re-processing of an already-`Error` sandbox,
+    // producing ~687 identical log lines/day for one dead-but-still-listed
+    // sandbox. These are plain pure-function assertions (no tracing
+    // subscriber / log capture) precisely because a log-capture test proved
+    // flaky under the shared, parallel `cargo test` binary: tracing's
+    // per-callsite interest cache is process-global, so a thread-local
+    // `set_default` subscriber can race with unrelated concurrently-running
+    // tests that exercise the same callsite under no subscriber at all.
+    #[test]
+    fn is_new_error_transition_true_on_transition_into_error() {
+        assert!(is_new_error_transition(
+            SandboxPhase::Ready,
+            SandboxPhase::Error
+        ));
+        assert!(is_new_error_transition(
+            SandboxPhase::Provisioning,
+            SandboxPhase::Error
+        ));
+    }
+
+    #[test]
+    fn is_new_error_transition_false_when_already_error() {
+        // This is the exact regression: a reconcile sweep re-processing an
+        // unchanged dead sandbox must not re-fire the warning.
+        assert!(!is_new_error_transition(
+            SandboxPhase::Error,
+            SandboxPhase::Error
+        ));
+    }
+
+    #[test]
+    fn is_new_error_transition_false_when_not_entering_error() {
+        assert!(!is_new_error_transition(
+            SandboxPhase::Error,
+            SandboxPhase::Ready
+        ));
+        assert!(!is_new_error_transition(
+            SandboxPhase::Provisioning,
+            SandboxPhase::Provisioning
+        ));
     }
 
     #[tokio::test]
