@@ -592,6 +592,7 @@ impl ProviderTypeProfile {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
+            allowed_secrets: Vec::new(),
         }
     }
 
@@ -1088,6 +1089,9 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+        cred_inject: None,
+        echo: false,
+        trust_check: None,
     }
 }
 

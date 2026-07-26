@@ -111,6 +111,7 @@ tokio-stream = "0.1"
 protobuf-src = "1.1.0"
 url = "2"
 indexmap = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate"] }

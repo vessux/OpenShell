@@ -1391,6 +1391,13 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Supervisor log level for this sandbox (trace, debug, info, warn, error).
+        /// Sets `SandboxSpec.log_level`; the driver passes it as
+        /// `OPENSHELL_LOG_LEVEL` to the in-container supervisor. Debug surfaces
+        /// the L7 egress request/response header lines in the proxy log.
+        #[arg(long)]
+        log_level: Option<String>,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -2912,6 +2919,7 @@ async fn main() -> Result<()> {
                     approval_mode,
                     output,
                     command,
+                    log_level,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
                     let tty_override = if no_tty {
@@ -2998,6 +3006,7 @@ async fn main() -> Result<()> {
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
+                            log_level: log_level.as_deref(),
                         },
                         &cli.workspace,
                         &tls,

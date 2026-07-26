@@ -1093,6 +1093,7 @@ fn network_rule_from_json(
         name: rule.name.unwrap_or_default(),
         endpoints,
         binaries,
+        allowed_secrets: Vec::new(),
     })
 }
 
@@ -1179,6 +1180,12 @@ fn network_endpoint_from_json(
         credential_signing: String::new(),
         signing_service: String::new(),
         signing_region: String::new(),
+        // Fork-added fields default to None/false — agent-authored policy
+        // proposals from policy.local don't construct cred_inject or trust
+        // mechanisms; those are gateway-side concerns.
+        cred_inject: None,
+        echo: false,
+        trust_check: None,
     })
 }
 
@@ -1924,6 +1931,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             }),
             ..Default::default()
         };
@@ -1948,6 +1956,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         }
     }
 
@@ -2023,6 +2032,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 }));
             })
         };

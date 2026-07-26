@@ -741,6 +741,56 @@ impl OpaEngine {
         Ok(val == regorus::Value::from(true))
     }
 
+    /// Query `matched_allowed_secrets` from the OPA policy for a given request.
+    ///
+    /// Returns the list of credential key names that the binary is allowed to
+    /// access, or an empty vec if the rule is undefined or returns no values.
+    /// Used by the proxy to scope `SecretResolver` to only the permitted keys.
+    pub fn query_allowed_secrets(&self, input: &NetworkInput) -> Result<Vec<String>> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.matched_allowed_secrets".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Array(arr) => Ok(arr
+                .iter()
+                .filter_map(|v| v.as_string().ok().map(ToString::to_string))
+                .collect()),
+            _ => Ok(vec![]),
+        }
+    }
+
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
     ///
     /// With the `arc` feature enabled, this shares compiled policy via Arc
@@ -1649,6 +1699,32 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 allow_all_known_mcp_methods.into();
                         }
                     }
+                    if let Some(ref ci) = e.cred_inject {
+                        let inject: Vec<serde_json::Value> = ci
+                            .inject
+                            .iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "header": h.header,
+                                    "from_credential": h.from_credential,
+                                    "value_prefix": h.value_prefix,
+                                })
+                            })
+                            .collect();
+                        ep["cred_inject"] = serde_json::json!({
+                            "provider": ci.provider,
+                            "strip_headers": ci.strip_headers,
+                            "inject": inject,
+                        });
+                    }
+                    if e.echo {
+                        ep["echo"] = true.into();
+                    }
+                    if let Some(ref tc) = e.trust_check {
+                        ep["trust_check"] = serde_json::json!({
+                            "registry": tc.registry,
+                        });
+                    }
                     ep
                 })
                 .collect();
@@ -1771,6 +1847,7 @@ mod tests {
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         network_policies.insert(
@@ -1786,6 +1863,7 @@ mod tests {
                     path: "/usr/bin/glab".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         ProtoSandboxPolicy {
@@ -2704,6 +2782,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3246,6 +3325,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -3318,6 +3398,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -3391,6 +3472,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -4324,6 +4406,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4382,6 +4465,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4441,6 +4525,7 @@ network_policies:
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4502,6 +4587,7 @@ network_policies:
                     path: "/usr/local/bin/aws".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4562,6 +4648,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5545,6 +5632,7 @@ process:
         network_policies.insert(
             "allow_mcp_internal_corp_example_com_8443".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "allow_mcp_internal_corp_example_com_8443".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "mcp-internal.corp.example.com".to_string(),
@@ -5595,6 +5683,7 @@ process:
         network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "internal-admin.local".to_string(),
@@ -5678,6 +5767,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5909,6 +5999,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6695,6 +6786,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -6769,6 +6861,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let registry = MiddlewareRegistry::connect_services(
@@ -6838,6 +6931,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         engine
@@ -7128,6 +7222,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -7206,6 +7301,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {

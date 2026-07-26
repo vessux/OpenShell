@@ -547,7 +547,8 @@ fn inspect_websocket_text_message(
         graphql: None,
         jsonrpc: None,
     };
-    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
+    let (allowed, reason) =
+        evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)?;
     let decision = match (allowed, inspector.enforcement) {
         (true, _) => "allow",
         (false, EnforcementMode::Audit) => "audit",
@@ -614,7 +615,7 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
-                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
+                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)?
             };
             let decision = match (allowed, inspector.enforcement) {
                 (_, _) if force_deny => "deny",

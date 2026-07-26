@@ -3885,6 +3885,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "chrono",
  "glob",
@@ -4283,6 +4284,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "flate2",
  "futures",
  "glob",

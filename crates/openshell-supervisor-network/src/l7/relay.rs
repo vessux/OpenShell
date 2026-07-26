@@ -16,7 +16,7 @@ use crate::l7::middleware::{
     middleware_chain_body_limit, middleware_events, middleware_request_input,
     raw_query_from_request_headers, resolve_unbuffered_body,
 };
-use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::provider::{BodyLength, L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
@@ -30,7 +30,7 @@ use openshell_ocsf::{
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
@@ -65,6 +65,14 @@ pub struct L7EvalContext {
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
+    /// Per-endpoint credential strip/inject configuration.
+    pub(crate) cred_inject: Option<super::CredInjectConfig>,
+    /// When true, return post-rewrite headers as JSON instead of forwarding upstream.
+    pub(crate) echo: bool,
+    /// Trust cache for deps.dev lookups (shared across connections).
+    pub(crate) trust_cache: Option<Arc<crate::trust::TrustCache>>,
+    /// Per-endpoint trust check config (registry type).
+    pub(crate) trust_check: Option<super::TrustCheckConfig>,
 }
 
 #[derive(Default)]
@@ -429,12 +437,14 @@ where
             return Ok(());
         }
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
         let force_deny = hard_deny_reason.is_some();
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(&engine, ctx, &request_info)?
+            evaluate_l7_request(&engine, ctx, &request_info, trust_result.as_ref())?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -493,7 +503,7 @@ where
                         target: redacted_target.clone(),
                         query_params: request_info.query_params.clone(),
                         raw_header: Vec::new(),
-                        body_length: crate::l7::provider::BodyLength::None,
+                        body_length: BodyLength::None,
                     };
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied_request,
@@ -521,6 +531,7 @@ where
                     signing_region: &config.signing_region,
                     host: &ctx.host,
                     port: ctx.port,
+                    cred_inject: ctx.cred_inject.as_ref(),
                 },
             )
             .await?;
@@ -889,8 +900,11 @@ where
             return Ok(());
         }
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) =
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -951,6 +965,66 @@ where
             ocsf_emit!(event);
         }
 
+        // Trust-specific OCSF events
+        if let Some(ref trust) = trust_result {
+            if trust.lookup_failed {
+                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Low)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_LOOKUP_FAILED {} {}@{} — allowing (fail-open)",
+                        request_info.action, trust.package_name, trust.version,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.critical_vulns > 0 {
+                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::High)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_DENIED {} {}@{} — {} critical vulnerabilities",
+                        request_info.action,
+                        trust.package_name,
+                        trust.version,
+                        trust.critical_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.high_vulns > 0 {
+                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Medium)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_AUDIT {} {}@{} — {} high vulnerabilities",
+                        request_info.action, trust.package_name, trust.version, trust.high_vulns,
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            }
+        }
+
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
@@ -977,7 +1051,7 @@ where
                         target: redacted_target.clone(),
                         query_params: request_info.query_params.clone(),
                         raw_header: Vec::new(),
-                        body_length: crate::l7::provider::BodyLength::None,
+                        body_length: BodyLength::None,
                     };
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied_request,
@@ -1005,6 +1079,40 @@ where
                     }
                 };
 
+            if ctx.echo {
+                // Echo mode: drain request body, then return post-rewrite headers as JSON.
+                let header_end = req_with_auth
+                    .raw_header
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(req_with_auth.raw_header.len(), |p| p + 4);
+                let overflow_len = req_with_auth.raw_header[header_end..].len() as u64;
+                if let BodyLength::ContentLength(len) = req_with_auth.body_length {
+                    let remaining = len.saturating_sub(overflow_len);
+                    if remaining > 0 {
+                        let mut discard = tokio::io::sink();
+                        let mut take = (&mut *client).take(remaining);
+                        tokio::io::copy(&mut take, &mut discard)
+                            .await
+                            .into_diagnostic()?;
+                    }
+                }
+
+                let outcome = crate::l7::rest::echo_http_request(
+                    &req_with_auth,
+                    client,
+                    ctx.secret_resolver.as_deref(),
+                    ctx.cred_inject.as_ref(),
+                    &ctx.policy_name,
+                )
+                .await?;
+                match outcome {
+                    RelayOutcome::Reusable => {}
+                    _ => return Ok(()),
+                }
+                continue;
+            }
+
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req_with_auth,
@@ -1021,6 +1129,7 @@ where
                     signing_region: &config.signing_region,
                     host: &ctx.host,
                     port: ctx.port,
+                    cred_inject: ctx.cred_inject.as_ref(),
                 },
             )
             .await?;
@@ -1068,6 +1177,23 @@ where
             return Ok(());
         }
     }
+}
+
+/// Extract trust data for the request when both a trust-check config and a
+/// trust cache are configured on the L7 endpoint. Returns `None` when trust is
+/// disabled, the registry is unrecognized, or the request target does not parse
+/// into a package reference.
+async fn extract_trust_result(
+    ctx: &L7EvalContext,
+    request_info: &L7RequestInfo,
+) -> Option<crate::trust::TrustResult> {
+    let (Some(tc), Some(cache)) = (&ctx.trust_check, &ctx.trust_cache) else {
+        return None;
+    };
+    let registry = crate::trust::Registry::parse(&tc.registry)?;
+    let pkg =
+        crate::trust::parse_package_ref(registry, &request_info.action, &request_info.target)?;
+    Some(cache.get_or_fetch(&pkg).await)
 }
 
 fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
@@ -1242,7 +1368,7 @@ where
                         target: redacted_target.clone(),
                         query_params: request_info.query_params.clone(),
                         raw_header: Vec::new(),
-                        body_length: crate::l7::provider::BodyLength::None,
+                        body_length: BodyLength::None,
                     };
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied_request,
@@ -1266,6 +1392,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 Some(engine.generation_guard()),
+                ctx.cred_inject.as_ref(),
             )
             .await?;
             match outcome {
@@ -1382,6 +1509,8 @@ where
             jsonrpc: None,
         };
 
+        let trust_result = extract_trust_result(ctx, &request_info).await;
+
         // Malformed or ambiguous GraphQL requests, such as duplicated GET
         // control parameters, are rejected before policy evaluation. This
         // keeps parser-differential cases fail-closed even if the endpoint is
@@ -1391,7 +1520,7 @@ where
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(engine, ctx, &request_info)?
+            evaluate_l7_request(engine, ctx, &request_info, trust_result.as_ref())?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -1466,7 +1595,7 @@ where
                         target: redacted_target.clone(),
                         query_params: request_info.query_params.clone(),
                         raw_header: Vec::new(),
-                        body_length: crate::l7::provider::BodyLength::None,
+                        body_length: BodyLength::None,
                     };
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied_request,
@@ -1485,6 +1614,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 Some(engine.generation_guard()),
+                ctx.cred_inject.as_ref(),
             )
             .await?;
             match outcome {
@@ -1672,20 +1802,21 @@ pub fn evaluate_l7_request(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
+    trust: Option<&crate::trust::TrustResult>,
 ) -> Result<(bool, String)> {
     if let Some(jsonrpc) = &request.jsonrpc
         && jsonrpc.is_batch
         && !jsonrpc.calls.is_empty()
     {
         if jsonrpc.has_response {
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request, trust)?;
             if !allowed {
                 return Ok((false, reason));
             }
         }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request, trust)?;
             if !allowed {
                 return Ok((false, reason));
             }
@@ -1693,7 +1824,7 @@ pub fn evaluate_l7_request(
         return Ok((true, String::new()));
     }
 
-    evaluate_l7_request_once(engine, ctx, request)
+    evaluate_l7_request_once(engine, ctx, request, trust)
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
@@ -1703,7 +1834,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request, None)?;
         if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
             return Ok(JsonRpcEvaluation {
                 allowed,
@@ -1718,7 +1849,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         let mut first_denied_reason = None;
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request, None)?;
             if !allowed {
                 if first_denied_reason.is_none() {
                     first_denied_reason = Some(reason);
@@ -1748,7 +1879,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         });
     }
 
-    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request, None)?;
     Ok(JsonRpcEvaluation {
         allowed,
         reason,
@@ -1818,7 +1949,7 @@ fn reevaluate_transformed_body(
                 target: request_info.target.clone(),
                 query_params: request_info.query_params.clone(),
                 raw_header: Vec::new(),
-                body_length: crate::l7::provider::BodyLength::None,
+                body_length: BodyLength::None,
             };
             let info = crate::l7::graphql::classify_request(&request, body);
             let mut transformed_info = request_info.clone();
@@ -1833,7 +1964,7 @@ fn reevaluate_transformed_body(
         return Ok(Some(reason));
     }
 
-    let (allowed, reason) = evaluate_l7_request(engine, ctx, &transformed_info)?;
+    let (allowed, reason) = evaluate_l7_request(engine, ctx, &transformed_info, None)?;
     if allowed {
         return Ok(None);
     }
@@ -1920,6 +2051,7 @@ fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
+    trust: Option<&crate::trust::TrustResult>,
 ) -> Result<(bool, String)> {
     if engine.is_stale() {
         return Err(miette!(
@@ -1929,7 +2061,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let mut input_json = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -1947,6 +2079,21 @@ fn evaluate_l7_request_once(
             "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
     });
+
+    if let Some(trust) = trust {
+        input_json["trust"] = serde_json::json!({
+            "package": trust.package_name,
+            "version": trust.version,
+            "registry": trust.registry,
+            "critical_vulns": trust.critical_vulns,
+            "high_vulns": trust.high_vulns,
+            "medium_vulns": trust.medium_vulns,
+            "low_vulns": trust.low_vulns,
+            "license": trust.license,
+            "is_stale": trust.is_stale,
+            "lookup_failed": trust.lookup_failed,
+        });
+    }
 
     let mut engine = engine
         .engine()
@@ -2098,7 +2245,7 @@ where
                         target: redacted_target.clone(),
                         query_params: std::collections::HashMap::new(),
                         raw_header: Vec::new(),
-                        body_length: crate::l7::provider::BodyLength::None,
+                        body_length: BodyLength::None,
                     };
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied_request,
@@ -2270,6 +2417,11 @@ network_policies:
             }
         };
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),
@@ -2378,6 +2530,11 @@ network_policies:
             }
         };
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),
@@ -3111,7 +3268,7 @@ network_policies:
             target: "/v1".into(),
             query_params: std::collections::HashMap::new(),
             raw_header: Vec::new(),
-            body_length: crate::l7::provider::BodyLength::None,
+            body_length: BodyLength::None,
         };
         let fail_open = ChainEntry {
             name: "m".into(),
@@ -3809,7 +3966,7 @@ network_policies:
             target: "/v1/messages".into(),
             query_params: std::collections::HashMap::new(),
             raw_header: raw_header.into_bytes(),
-            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+            body_length: BodyLength::ContentLength(body.len() as u64),
         };
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         app.write_all(&body).await.unwrap();
@@ -3919,7 +4076,7 @@ network_policies:
             target: "/v1/messages".into(),
             query_params: std::collections::HashMap::new(),
             raw_header: Vec::new(),
-            body_length: crate::l7::provider::BodyLength::None,
+            body_length: BodyLength::None,
         };
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
@@ -3968,7 +4125,7 @@ network_policies:
             target: "/v1/messages".into(),
             query_params: std::collections::HashMap::new(),
             raw_header: Vec::new(),
-            body_length: crate::l7::provider::BodyLength::None,
+            body_length: BodyLength::None,
         };
         let outcome = ChainOutcome {
             allowed: true,
@@ -4483,7 +4640,7 @@ network_policies:
             jsonrpc: None,
         };
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
 
         assert!(!allowed);
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
@@ -4564,7 +4721,7 @@ network_policies:
             )),
         };
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(allowed, "{reason}");
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
@@ -4574,7 +4731,7 @@ network_policies:
             ]"#,
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(!allowed);
         assert!(reason.contains("response frames"));
 
@@ -4592,7 +4749,7 @@ network_policies:
             br#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#,
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(!allowed);
         assert!(reason.contains("response frames"));
 
@@ -4611,7 +4768,7 @@ network_policies:
             ]"#,
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
-        let (allowed, _) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, _) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(!allowed);
 
         let jsonrpc = request.jsonrpc.as_ref().expect("jsonrpc request");
@@ -4682,13 +4839,13 @@ network_policies:
             )),
         };
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(allowed, "{reason}");
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"reports.search","params":["ignored",{"nested":true}]}"#,
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(allowed, "{reason}");
     }
 
@@ -4745,7 +4902,7 @@ network_policies:
             )),
         };
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(allowed, "{reason}");
         let allowed_info = request.jsonrpc.as_ref().expect("parsed MCP request");
         let allowed_message = jsonrpc_log_message(
@@ -4773,7 +4930,7 @@ network_policies:
             Some("delete_resource")
         );
 
-        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request, None).unwrap();
         assert!(!allowed, "delete_resource must match the MCP deny rule");
         assert!(
             reason.contains("deny rule"),
@@ -4981,6 +5138,7 @@ network_policies:
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
             signing_region: String::new(),
+            echo: false,
         }];
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
@@ -5087,6 +5245,7 @@ network_policies:
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
             signing_region: String::new(),
+            echo: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
@@ -5210,6 +5369,7 @@ network_policies:
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
             signing_region: String::new(),
+            echo: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("T".to_string(), "real-token".to_string())).collect(),

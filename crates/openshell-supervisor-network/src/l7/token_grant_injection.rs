@@ -714,6 +714,11 @@ mod tests {
         );
 
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.com".into(),
             port: 443,
             policy_name: "api".into(),
@@ -751,6 +756,11 @@ mod tests {
         );
 
         let ctx = L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+
             host: "api.example.com".into(),
             port: 443,
             policy_name: "api".into(),
