@@ -43,7 +43,12 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # The gateway links z3 (upstream prover dep) and compiles it from source,
+    # which pushed the slower amd64 runner past the original 60 min; kept at 120
+    # for headroom. Only the gateway builds z3 -- one z3 compile per job, not
+    # two -- since upstream dropped the CLI's prover dependency. Follow-up:
+    # sccache would cut release wall-clock further.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
         with:
@@ -58,19 +63,75 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The gateway (openshell-server) statically links z3 via --features
+      # bundled-z3 (no runtime libz3.so.4). The vendored z3 source hits
+      # overload-resolution errors under modern system clang, so — mirroring
+      # upstream release-dev.yml — zig provides the C/C++ toolchain and linker
+      # for the z3 build. Only the gateway build step opts into this (via that
+      # step's env:); the CLI and sandbox supervisor don't link z3 and keep the
+      # default toolchain.
+      - name: Set up zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Configure zig C/C++ wrappers for z3
+        run: |
+          set -euo pipefail
+          ZIG="$(command -v zig)"
+          mkdir -p /tmp/zig-cc
+
+          # cc-rs injects --target=<rust-triple> (for example
+          # x86_64-unknown-linux-gnu), which zig does not parse. Strip any
+          # caller-provided --target. WITHOUT -target, zig cc defaults to the
+          # *runner's native* CPU, baking AVX2/BMI2/FMA into the bundled z3 —
+          # which SIGILLs on older CPUs (e.g. pre-Haswell Ivy Bridge). Pin a
+          # portable ISA baseline per arch so the released binaries run anywhere.
+          case "${{ matrix.target }}" in
+            x86_64-*)  MCPU="x86_64_v2" ;;  # SSE4.2/POPCNT, ~2008+; ample for z3
+            aarch64-*) MCPU="baseline" ;;   # armv8-a, universal aarch64
+            *)         MCPU="baseline" ;;
+          esac
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s -mcpu=%s "${args[@]}"\n' \
+              "$ZIG" "$tool" "$MCPU" > "/tmp/zig-cc/${tool}"
+            chmod +x "/tmp/zig-cc/${tool}"
+          done
+
       - name: Cache cargo target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: openlock-release-${{ matrix.target }}
 
+      # The gateway (openshell-server) gained an upstream prover dependency that
+      # pulls z3-sys; build it with bundled-z3 via the zig toolchain (same as the
+      # CLI) so the released gateway has no runtime libz3.so.4 dependency.
       - name: Build openshell-gateway
-        run: cargo build --release --target ${{ matrix.target }} -p openshell-server
+        env:
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          TARGET_ENV_UPPER=${TARGET_ENV^^}
+          export "CC_${TARGET_ENV}=/tmp/zig-cc/cc"
+          export "CXX_${TARGET_ENV}=/tmp/zig-cc/c++"
+          export "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-cc/cc"
+          cargo build --release --target ${{ matrix.target }} -p openshell-server --features bundled-z3
 
       - name: Build openshell-sandbox (supervisor)
         run: cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
 
+      # The CLI does NOT link z3: upstream removed the `policy prove` command
+      # and the openshell-prover dependency from openshell-cli, so no z3-sys
+      # reaches its tree (`cargo tree -i z3-sys` shows only openshell-server).
+      # Plain default toolchain — no zig, no bundled-z3 feature. Passing
+      # --features bundled-z3 here would hard-error: openshell-cli no longer
+      # declares that feature.
       - name: Build openshell CLI
-        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
+        run: cargo build --release --target ${{ matrix.target }} -p openshell-cli
 
       - name: Package binaries
         run: |
@@ -100,7 +161,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Install protobuf
+      - name: Install build deps
         run: brew install protobuf
 
       - name: Set up Rust
@@ -108,16 +169,65 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      # The gateway (openshell-server) statically links z3 via --features
+      # bundled-z3 (no runtime libz3 dylib). The vendored z3 source hits
+      # overload-resolution errors under the runner's older Apple clang, so —
+      # mirroring the Linux job and upstream release-dev.yml — zig provides the
+      # C/C++ compiler for the z3 build. zig only COMPILES z3 (built static);
+      # the final binary is linked by the default system linker (ld64), because
+      # zig cannot link a macOS executable. Only the gateway build step opts in
+      # (via its env:); the CLI doesn't link z3 and keeps the default toolchain.
+      - name: Set up zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Configure zig C/C++ wrappers for z3
+        run: |
+          set -euo pipefail
+          ZIG="$(command -v zig)"
+          mkdir -p /tmp/zig-cc
+
+          # cc-rs injects --target=<rust-triple>, which zig does not parse;
+          # strip it and let zig use its native default. -fno-sanitize=all
+          # disables zig cc's default UBSan instrumentation, whose
+          # __ubsan_handle_* symbols are otherwise unresolved when the system
+          # linker links the final Rust binary.
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s -fno-sanitize=all "${args[@]}"\n' \
+              "$ZIG" "$tool" > "/tmp/zig-cc/${tool}"
+            chmod +x "/tmp/zig-cc/${tool}"
+          done
+
       - name: Cache cargo target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: openlock-release-aarch64-apple-darwin
 
+      # The gateway (openshell-server) gained an upstream prover dependency that
+      # pulls z3-sys; build it with bundled-z3 via the zig toolchain (same as the
+      # CLI) so the released gateway works on a clean Mac with no Homebrew z3.
       - name: Build openshell-gateway
-        run: cargo build --release --target "$TARGET" -p openshell-server
+        env:
+          CC: /tmp/zig-cc/cc
+          CXX: /tmp/zig-cc/c++
+          CC_aarch64_apple_darwin: /tmp/zig-cc/cc
+          CXX_aarch64_apple_darwin: /tmp/zig-cc/c++
+          CXXSTDLIB: c++
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+        run: cargo build --release --target "$TARGET" -p openshell-server --features bundled-z3
 
+      # The CLI does NOT link z3: upstream removed the `policy prove` command
+      # and the openshell-prover dependency from openshell-cli, so no z3-sys
+      # reaches its tree (`cargo tree -i z3-sys` shows only openshell-server).
+      # No zig and no bundled-z3 feature — passing --features bundled-z3 here
+      # would hard-error, since openshell-cli no longer declares it.
+      # MACOSX_DEPLOYMENT_TARGET is unrelated to z3 and stays.
       - name: Build openshell CLI
-        run: cargo build --release --target "$TARGET" -p openshell-cli --features bundled-z3
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --target "$TARGET" -p openshell-cli
 
       - name: Package binaries
         run: |
