@@ -339,6 +339,13 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Field 9003 was `volumes` (fork-added `BindVolume` passthrough for the
+  // `--volume HOST:CONTAINER[:ro]` CLI flag). Removed: bind mounts now flow
+  // through the upstream `SandboxTemplate.driver_config` envelope (driver
+  // -config-json), which already supports typed bind/volume/tmpfs/image
+  // mounts. Reserved rather than reused per fork field-number policy.
+  reserved 9003;
+  reserved "volumes";
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

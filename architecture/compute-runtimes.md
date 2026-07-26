@@ -89,6 +89,39 @@ Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
 
+## User Bind Volumes
+
+Sandboxes accept `--volume <HOST>:<CONTAINER>[:ro]` at creation time. The host
+path must be absolute and exist; the container path must be absolute. The
+optional `:ro` suffix makes the bind read-only.
+
+`--volume` is CLI sugar over `template.driver_config`: the CLI translates each
+flag into a `{"type": "bind", "source", "target", "read_only"}` mount entry
+under the active driver's block (the same shape `--driver-config-json` accepts
+directly), always emitting `read_only` explicitly. Podman and Docker require
+`enable_bind_mounts = true` under their respective `[openshell.drivers.*]`
+config table before they will honor any bind mount, whether it arrived via
+`--volume` or a raw `--driver-config-json` bind entry.
+
+On rootless Podman, the driver inspects the sandbox image's `Config.User`
+directive and sets the libpod `userns` field to `keep-id` with the image uid.
+This maps the container sandbox uid bidirectionally to the host caller's uid so
+bind files are mutually readable and writable across the namespace boundary
+without manual ownership changes. The `userns` override is applied only when
+the resolved driver-config carries at least one bind-type mount (whether it
+arrived via `--volume` or a raw `--driver-config-json` bind entry); sandboxes
+without bind mounts continue to use the default rootless mapping.
+
+Docker and Kubernetes do not receive automatic userns remapping from the driver.
+Docker rootless requires daemon-wide `userns-remap` configuration. Kubernetes
+bind volumes follow cluster storage and security context policies. The VM
+driver has no bind-mount support at all. Because driver selection happens
+gateway-side, the CLI populates the `vm` driver-config block the same as
+`podman`/`docker`; the VM driver's own config validation then rejects a
+non-empty `mounts` list with `bind mounts not supported on vm driver`, so a
+`--volume` flag against a VM-driver gateway fails loudly at sandbox-create
+time rather than being silently dropped.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images

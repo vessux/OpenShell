@@ -811,6 +811,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -855,6 +856,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -933,6 +935,7 @@ async fn sandbox_create_sends_driver_config_json() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1008,6 +1011,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1067,6 +1071,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1122,6 +1127,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1169,6 +1175,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1212,6 +1219,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1259,6 +1267,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1306,6 +1315,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1353,6 +1363,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         &HashMap::new(),
         &HashMap::new(),
         "manual",
+        &[],
         None,
         &tls,
     )
@@ -1396,6 +1407,7 @@ async fn sandbox_create_sends_environment_variables() {
         &HashMap::new(),
         &env_map,
         "manual",
+        &[],
         None,
         &tls,
     )

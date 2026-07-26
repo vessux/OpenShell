@@ -3,6 +3,7 @@
 
 //! Container spec construction for the Podman driver.
 
+use crate::client::COMMUNITY_SANDBOX_UID;
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
 use openshell_core::gpu::cdi_gpu_device_ids;
@@ -204,6 +205,8 @@ struct ContainerSpec {
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userns: Option<UserNamespace>,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -292,6 +295,14 @@ struct MemoryLimits {
 #[derive(Serialize)]
 struct NetNS {
     nsmode: String,
+}
+
+/// libpod `Namespace` entry for `userns`.
+#[derive(Serialize)]
+struct UserNamespace {
+    nsmode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    value: String,
 }
 
 #[derive(Serialize)]
@@ -636,6 +647,21 @@ fn podman_user_mounts(
     Ok(result)
 }
 
+/// Returns true if the sandbox's resolved podman driver-config carries at
+/// least one bind-type mount. Used by the driver to decide whether the
+/// `PodmanClient::image_user` image-inspect round-trip is worth performing
+/// before building the container spec (the round-trip is only needed to pick
+/// the userns-remap uid/gid).
+///
+/// Malformed driver-config is reported as `false` here rather than
+/// propagated: the authoritative validation error still surfaces from
+/// `podman_user_mounts` when the container spec is built, this is purely an
+/// early-exit optimization.
+pub fn podman_config_has_bind_mount(sandbox: &DriverSandbox, enable_bind_mounts: bool) -> bool {
+    podman_user_mounts(sandbox, enable_bind_mounts)
+        .is_ok_and(|mounts| mounts.mounts.iter().any(|m| m.kind == "bind"))
+}
+
 fn podman_driver_config(
     template: &DriverSandboxTemplate,
     enable_bind_mounts: bool,
@@ -773,8 +799,12 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
-pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
-    try_build_container_spec_with_token(sandbox, config, None)
+pub fn build_container_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    image_sandbox_user: Option<(u32, u32)>,
+) -> Value {
+    build_container_spec_with_token_and_gpu_default(sandbox, config, None, None, image_sandbox_user)
         .expect("container spec should be valid")
 }
 
@@ -795,7 +825,7 @@ pub fn try_build_container_spec_with_token(
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
-    build_container_spec_with_token_and_gpu_default(sandbox, config, token_host_path, None)
+    build_container_spec_with_token_and_gpu_default(sandbox, config, token_host_path, None, None)
 }
 
 pub fn build_container_spec_with_token_and_gpu_default(
@@ -803,6 +833,7 @@ pub fn build_container_spec_with_token_and_gpu_default(
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
     selected_default_device: Option<&str>,
+    image_sandbox_user: Option<(u32, u32)>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
@@ -813,6 +844,12 @@ pub fn build_container_spec_with_token_and_gpu_default(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
+    // Captured before `user_mounts.mounts` is moved into the container spec's
+    // mount list below — this is the re-keyed userns-remap trigger: it used to
+    // fire on the fork's own (now-removed) `spec.volumes`, and now fires on
+    // any bind-type mount in the resolved driver-config, however it arrived
+    // (the `--volume` CLI sugar or a raw `--driver-config-json` bind mount).
+    let has_bind_mount = user_mounts.mounts.iter().any(|m| m.kind == "bind");
     let devices = build_devices(sandbox, selected_default_device)?;
 
     // Network configuration -- always bridge mode.
@@ -836,7 +873,7 @@ pub fn build_container_spec_with_token_and_gpu_default(
     }];
     image_volumes.extend(user_mounts.image_volumes);
 
-    let container_spec = ContainerSpec {
+    let mut container_spec = ContainerSpec {
         name,
         image: image.to_string(),
         labels,
@@ -1030,7 +1067,24 @@ pub fn build_container_spec_with_token_and_gpu_default(
             container_port: openshell_core::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
+        userns: None,
     };
+
+    // Auto userns-remap on rootless podman: when the resolved driver-config
+    // carries at least one bind-type mount (already folded into
+    // `container_spec.mounts` above via `user_mounts`), set
+    // `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>` so
+    // bind-mount file ownership maps bidirectionally between host and
+    // container. `image_sandbox_user` is resolved by the caller (driver.rs)
+    // from the image's `Config.User` directive.
+    if has_bind_mount {
+        let (uid, gid) =
+            image_sandbox_user.unwrap_or((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
+        container_spec.userns = Some(UserNamespace {
+            nsmode: "keep-id".into(),
+            value: format!("uid={uid},gid={gid}"),
+        });
+    }
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
 }
@@ -1200,7 +1254,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert_eq!(
             spec["resource_limits"]["cpu"]["quota"].as_u64(),
@@ -1221,7 +1275,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.sandbox_pids_limit = 0;
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
@@ -1249,7 +1303,7 @@ mod tests {
     fn container_spec_omits_devices_without_gpu_request() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert!(spec.get("devices").is_none());
     }
@@ -1269,6 +1323,7 @@ mod tests {
             &config,
             None,
             Some("nvidia.com/gpu=1"),
+            None,
         )
         .unwrap();
 
@@ -1289,8 +1344,9 @@ mod tests {
         });
         let config = test_config();
 
-        let err = build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None)
-            .unwrap_err();
+        let err =
+            build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None, None)
+                .unwrap_err();
 
         assert!(matches!(err, ComputeDriverError::Precondition(_)));
         assert!(err.to_string().contains("selected default CDI GPU device"));
@@ -1310,7 +1366,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
@@ -1381,7 +1437,7 @@ mod tests {
     fn container_spec_includes_required_capabilities() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let added: Vec<&str> = spec["cap_add"]
             .as_array()
@@ -1429,7 +1485,7 @@ mod tests {
     fn container_spec_sets_sandbox_name_in_env() {
         let sandbox = test_sandbox("test-id", "my-sandbox");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -1444,7 +1500,7 @@ mod tests {
     fn container_spec_sets_ssh_socket_path_in_env() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -1459,7 +1515,7 @@ mod tests {
     fn container_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let healthcheck = spec["healthconfig"]["test"]
             .as_array()
@@ -1479,7 +1535,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.health_check_interval_secs = 30;
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let interval = spec["healthconfig"]["Interval"]
             .as_u64()
@@ -1509,7 +1565,7 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
 
@@ -1553,7 +1609,7 @@ mod tests {
                     ..Default::default()
                 });
 
-                let spec = build_container_spec(&sandbox, &test_config());
+                let spec = build_container_spec(&sandbox, &test_config(), None);
                 let env_map = spec["env"].as_object().expect("env should be an object");
 
                 assert_eq!(
@@ -1592,7 +1648,7 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let labels = spec["labels"]
             .as_object()
@@ -1622,7 +1678,7 @@ mod tests {
     fn container_spec_injects_host_aliases() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()
@@ -1713,7 +1769,7 @@ mod tests {
     fn container_spec_includes_supervisor_image_volume() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let image_volumes = spec["image_volumes"]
             .as_array()
@@ -1777,7 +1833,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let volumes = spec["volumes"]
             .as_array()
@@ -1844,7 +1900,7 @@ mod tests {
         });
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let volumes = spec["volumes"]
             .as_array()
             .expect("volumes should be an array");
@@ -1879,7 +1935,7 @@ mod tests {
         });
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let volumes = spec["volumes"]
             .as_array()
             .expect("volumes should be an array");
@@ -1940,7 +1996,7 @@ mod tests {
         let mut config = test_config();
         config.enable_bind_mounts = true;
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
@@ -1979,7 +2035,7 @@ mod tests {
         let mut config = test_config();
         config.enable_bind_mounts = true;
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
@@ -2056,7 +2112,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.host_gateway_ip = "192.168.127.254".to_string();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()
@@ -2087,7 +2143,7 @@ mod tests {
         config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
         config.guest_tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         // Verify TLS env vars are set.
         let env_map = spec["env"].as_object().expect("env should be an object");
@@ -2185,7 +2241,7 @@ mod tests {
         let sandbox = test_sandbox("notls-id", "notls-name");
         let config = test_config();
 
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec(&sandbox, &config, None);
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert!(
@@ -2201,5 +2257,72 @@ mod tests {
             .filter(|m| m["type"].as_str() == Some("bind"))
             .count();
         assert_eq!(bind_count, 0, "no bind mounts without TLS config");
+    }
+
+    #[test]
+    fn build_container_spec_sets_userns_keep_id_when_bind_mount_present() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("id-1", "name-1");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host",
+                        "target": "/sandbox/container",
+                        "read_only": false
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut cfg = test_config();
+        cfg.enable_bind_mounts = true;
+        let spec_value = build_container_spec(&sandbox, &cfg, Some((1_000_660_000, 1_000_660_000)));
+        let userns = spec_value.get("userns").expect("userns set");
+        assert_eq!(
+            userns.get("nsmode").and_then(|v| v.as_str()).unwrap(),
+            "keep-id"
+        );
+        assert_eq!(
+            userns.get("value").and_then(|v| v.as_str()).unwrap(),
+            "uid=1000660000,gid=1000660000"
+        );
+    }
+
+    #[test]
+    fn build_container_spec_omits_userns_when_no_bind_mount() {
+        let sandbox = test_sandbox("id-1", "name-1");
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, None);
+        assert!(spec_value.get("userns").is_none() || spec_value.get("userns").unwrap().is_null());
+    }
+
+    #[test]
+    fn build_container_spec_omits_userns_for_non_bind_mounts() {
+        // A driver-config mount that ISN'T bind-type (e.g. a named volume)
+        // must not trigger the userns-remap — only host-path bind mounts
+        // need the uid/gid ownership fixup.
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("id-1", "name-1");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, None);
+        assert!(spec_value.get("userns").is_none() || spec_value.get("userns").unwrap().is_null());
     }
 }

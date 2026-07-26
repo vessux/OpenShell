@@ -87,6 +87,7 @@ workspace = true
 [features]
 bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
+e2e = []
 
 [dev-dependencies]
 futures = { workspace = true }

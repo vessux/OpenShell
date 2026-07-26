@@ -507,11 +507,26 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
+        let image_sandbox_user =
+            if container::podman_config_has_bind_mount(sandbox, self.config.enable_bind_mounts) {
+                let image_ref = container::resolve_image(sandbox, &self.config);
+                match self.client.image_user(image_ref).await {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        let _ = self.client.remove_volume(&vol_name).await;
+                        cleanup_sandbox_token_file(&sandbox.id);
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                None
+            };
         let spec = match container::build_container_spec_with_token_and_gpu_default(
             sandbox,
             &self.config,
             token_host_path.as_deref(),
             selected_default_gpu.as_deref(),
+            image_sandbox_user,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -1109,6 +1124,7 @@ mod tests {
             &driver.config,
             None,
             first_device.as_deref(),
+            None,
         )
         .unwrap();
 
@@ -1122,6 +1138,7 @@ mod tests {
             &driver.config,
             None,
             second_device.as_deref(),
+            None,
         )
         .unwrap();
 

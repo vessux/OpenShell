@@ -17,3 +17,4 @@ pub(crate) mod policy_update;
 pub mod run;
 pub mod ssh;
 pub mod tls;
+pub mod volume_spec;
