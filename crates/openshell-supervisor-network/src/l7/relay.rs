@@ -900,50 +900,51 @@ where
                     RelayOutcome::Reusable => {}
                     _ => return Ok(()),
                 }
-            } else {
-                // Forward request to upstream and relay response
-                let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
-                    &req_with_auth,
-                    client,
-                    upstream,
-                    crate::l7::rest::RelayRequestOptions {
-                        resolver: ctx.secret_resolver.as_deref(),
-                        generation_guard: Some(engine.generation_guard()),
-                        websocket_extensions: websocket_extension_mode(config),
-                        request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                            && config.request_body_credential_rewrite,
-                        cred_inject: ctx.cred_inject.as_ref(),
-                    },
-                )
-                .await?;
-                match outcome {
-                    RelayOutcome::Reusable => {} // continue loop
-                    RelayOutcome::Consumed => {
-                        debug!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            "Upstream connection not reusable, closing L7 relay"
-                        );
-                        return Ok(());
-                    }
-                    RelayOutcome::Upgraded {
-                        overflow,
-                        websocket_permessage_deflate,
-                    } => {
-                        let mut options = upgrade_options(
-                            config,
-                            ctx,
-                            websocket_request,
-                            &redacted_target,
-                            &req_with_auth.query_params,
-                            Some(engine),
-                        );
-                        options.websocket.permessage_deflate = websocket_permessage_deflate;
-                        return handle_upgrade(
-                            client, upstream, overflow, &ctx.host, ctx.port, options,
-                        )
-                        .await;
-                    }
+                continue;
+            }
+
+            // Forward request to upstream and relay response
+            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+                &req_with_auth,
+                client,
+                upstream,
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    websocket_extensions: websocket_extension_mode(config),
+                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                        && config.request_body_credential_rewrite,
+                    cred_inject: ctx.cred_inject.as_ref(),
+                },
+            )
+            .await?;
+            match outcome {
+                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded {
+                    overflow,
+                    websocket_permessage_deflate,
+                } => {
+                    let mut options = upgrade_options(
+                        config,
+                        ctx,
+                        websocket_request,
+                        &redacted_target,
+                        &req_with_auth.query_params,
+                        Some(engine),
+                    );
+                    options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    return handle_upgrade(
+                        client, upstream, overflow, &ctx.host, ctx.port, options,
+                    )
+                    .await;
                 }
             }
         } else {

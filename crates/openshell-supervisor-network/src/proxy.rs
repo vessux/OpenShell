@@ -618,8 +618,11 @@ async fn handle_tcp_connection(
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     // Query L7 config early so we can detect echo mode before DNS resolution.
-    let echo_l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
-    let is_echo = echo_l7_route
+    // `query_l7_route_snapshot` is a pure function of (engine, decision, host,
+    // port) — all four fixed above — so this single query also serves the
+    // non-echo path below; it is intentionally not re-queried later.
+    let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
+    let is_echo = l7_route
         .as_ref()
         .and_then(|route| route.configs.first())
         .is_some_and(|snapshot| snapshot.config.echo);
@@ -691,10 +694,7 @@ async fn handle_tcp_connection(
         // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
         let (mut dummy_upstream, _dummy_rx) = tokio::io::duplex(1);
 
-        if let Some(route) = echo_l7_route
-            .as_ref()
-            .filter(|route| !route.configs.is_empty())
-        {
+        if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
             let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
                 Ok(engine) => engine,
                 Err(e) => {
@@ -1034,9 +1034,9 @@ async fn handle_tcp_connection(
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    // Check if endpoint has L7 config for protocol-aware inspection, and
+    // L7 route snapshot already queried above (`l7_route`, used for the
+    // echo-mode check) — reused here for protocol-aware inspection and to
     // retain the generation for HTTP passthrough keep-alive tunnels.
-    let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
     let should_inspect_l7 = l7_inspection_active(l7_route.as_ref());
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
