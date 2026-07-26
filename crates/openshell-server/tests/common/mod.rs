@@ -24,6 +24,7 @@ use openshell_core::proto::{
     ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
     RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
@@ -122,6 +123,20 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        Ok(Response::new(StartSandboxResponse { started: true }))
     }
 
     async fn get_sandbox_config(

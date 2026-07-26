@@ -19,8 +19,9 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
+    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -582,6 +583,42 @@ async fn handle_delete_sandbox_inner(
     Ok(Response::new(DeleteSandboxResponse {
         deleted: result.deleted,
     }))
+}
+
+pub(super) async fn handle_stop_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<StopSandboxRequest>,
+) -> Result<Response<StopSandboxResponse>, Status> {
+    let req = request.into_inner();
+    let name = req.name;
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
+
+    state.compute.stop_sandbox(&workspace, &name).await?;
+    info!(sandbox_name = %name, "StopSandbox request completed successfully");
+    Ok(Response::new(StopSandboxResponse {}))
+}
+
+pub(super) async fn handle_start_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<StartSandboxRequest>,
+) -> Result<Response<StartSandboxResponse>, Status> {
+    let req = request.into_inner();
+    let name = req.name;
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
+
+    let started = state.compute.start_sandbox(&workspace, &name).await?;
+    info!(sandbox_name = %name, started, "StartSandbox request completed successfully");
+    Ok(Response::new(StartSandboxResponse { started }))
 }
 
 async fn sandbox_by_name(
@@ -3870,6 +3907,23 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
+    // ---- handle_stop_sandbox / handle_start_sandbox ----
+
+    #[tokio::test]
+    async fn handle_stop_sandbox_rejects_empty_name() {
+        let state = test_server_state().await;
+        let err = handle_stop_sandbox(
+            &state,
+            Request::new(StopSandboxRequest {
+                name: String::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect_err("empty name should be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
     #[tokio::test]
     async fn revoke_ssh_session_preserves_workspace() {
         let state = test_server_state().await;
@@ -3906,5 +3960,50 @@ mod tests {
             .expect("session should still exist after revocation");
         assert!(session.revoked);
         assert_eq!(session.object_workspace(), "default");
+    }
+
+    #[tokio::test]
+    async fn handle_stop_sandbox_returns_not_found_for_unknown_sandbox() {
+        let state = test_server_state().await;
+        let err = handle_stop_sandbox(
+            &state,
+            Request::new(StopSandboxRequest {
+                name: "ghost".to_string(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect_err("unknown sandbox should be NotFound");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn handle_start_sandbox_rejects_empty_name() {
+        let state = test_server_state().await;
+        let err = handle_start_sandbox(
+            &state,
+            Request::new(StartSandboxRequest {
+                name: String::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect_err("empty name should be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn handle_start_sandbox_returns_not_found_for_unknown_sandbox() {
+        let state = test_server_state().await;
+        let err = handle_start_sandbox(
+            &state,
+            Request::new(StartSandboxRequest {
+                name: "ghost".to_string(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect_err("unknown sandbox should be NotFound");
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

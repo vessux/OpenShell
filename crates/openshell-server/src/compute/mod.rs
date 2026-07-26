@@ -29,7 +29,8 @@ use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
+    ResourceRequirements as DriverSandboxResourceRequirements,
+    StopSandboxRequest as DriverStopSandboxRequest, ValidateSandboxCreateRequest,
     WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
@@ -191,6 +192,15 @@ trait StartupResume: Send + Sync {
 
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
+    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id, sandbox_name)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[tonic::async_trait]
+impl StartupResume for PodmanComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
             .await
@@ -380,6 +390,12 @@ impl fmt::Debug for ComputeRuntime {
     }
 }
 
+/// Label stamped onto a Sandbox's metadata by `stop_sandbox` and cleared by
+/// `start_sandbox`. When the label is present and the watch loop derives
+/// `Error` (because the container exited), the phase is overridden to
+/// `Stopped` so callers can distinguish a user-requested halt from a crash.
+const STOP_REQUESTED_LABEL: &str = "openshell.io/stop-requested";
+
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
@@ -552,15 +568,18 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        let inner = Arc::new(
+            PodmanComputeDriver::new(config)
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let startup_resume: Arc<dyn StartupResume> = inner.clone();
+        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new((*inner).clone()));
         Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
             driver,
             None,
-            None,
+            Some(startup_resume),
             None,
             store,
             sandbox_index,
@@ -1252,6 +1271,93 @@ impl ComputeRuntime {
         Ok(sandbox)
     }
 
+    /// Stop the compute resource backing a sandbox without removing the
+    /// sandbox record. Workspace volume and provider links survive. Phase
+    /// is left to the watch loop to update as the backend transitions —
+    /// but the runtime stamps a `stop-requested` label first so the watch
+    /// loop maps the ensuing `ContainerExited` to `Stopped`, not `Error`.
+    /// Idempotent: a missing or already-stopped backend resource is not
+    /// an error.
+    pub async fn stop_sandbox(&self, workspace: &str, name: &str) -> Result<(), Status> {
+        let sandbox = self
+            .store
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+        let Some(sandbox) = sandbox else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+
+        let _ = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |s| {
+                if let Some(metadata) = s.metadata.as_mut() {
+                    metadata
+                        .labels
+                        .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+                }
+            })
+            .await
+            .map_err(|e| {
+                warn!(sandbox_name = %name, error = %e, "Failed to stamp stop-requested label");
+            });
+
+        let driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
+        self.driver
+            .stop_sandbox(Request::new(DriverStopSandboxRequest {
+                sandbox_id: driver_sandbox.id,
+                sandbox_name: driver_sandbox.name,
+            }))
+            .await
+            .map(|_| ())
+            .map_err(|err| Status::internal(format!("stop sandbox failed: {}", err.message())))
+    }
+
+    /// Start a previously-stopped sandbox backend resource. Idempotent:
+    /// an already-running container returns success. Returns
+    /// `Ok(false)` when the record exists but the backend resource is
+    /// missing — caller should surface this so the user can recreate.
+    pub async fn start_sandbox(&self, workspace: &str, name: &str) -> Result<bool, Status> {
+        let sandbox = self
+            .store
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+        let Some(sandbox) = sandbox else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+
+        let Some(resume) = &self.startup_resume else {
+            return Err(Status::unimplemented(
+                "start sandbox not supported by configured compute driver",
+            ));
+        };
+
+        let started = resume
+            .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+            .await
+            .map_err(|err| Status::internal(format!("start sandbox failed: {err}")))?;
+
+        if started {
+            let _ = self
+                .store
+                .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |s| {
+                    if let Some(metadata) = s.metadata.as_mut() {
+                        metadata.labels.remove(STOP_REQUESTED_LABEL);
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    warn!(sandbox_name = %name, error = %e, "Failed to clear stop-requested label");
+                });
+        }
+
+        Ok(started)
+    }
+
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
         if self.store.is_single_replica() {
@@ -1737,7 +1843,12 @@ impl ComputeRuntime {
         };
         let current_phase =
             SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
-        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+        // Skip if sandbox is in terminal state. Stopped is intentional; a stale
+        // supervisor session event must not silently reanimate it.
+        if matches!(
+            current_phase,
+            SandboxPhase::Deleting | SandboxPhase::Error | SandboxPhase::Stopped
+        ) {
             return Ok(());
         }
         if !connected && current_phase != SandboxPhase::Ready {
@@ -2447,6 +2558,14 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         phase = SandboxPhase::Ready;
     }
 
+    // Distinguish user-requested stop from a crash: when `stop_sandbox`
+    // stamped the stop-requested label, treat the container's terminal
+    // exit as `Stopped` rather than `Error`. The label is cleared by
+    // `start_sandbox` on a successful resume.
+    if phase == SandboxPhase::Error && sandbox_has_stop_requested_label(sandbox) {
+        phase = SandboxPhase::Stopped;
+    }
+
     let cpv = sandbox.current_policy_version();
     let mut status = incoming
         .status
@@ -2474,7 +2593,7 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         );
     }
 
-    if phase == SandboxPhase::Error
+    if is_new_error_transition(old_phase, phase)
         && let Some(ref status) = status
     {
         for condition in &status.conditions {
@@ -2571,6 +2690,13 @@ fn public_platform_event_from_driver(event: &DriverPlatformEvent) -> PlatformEve
     }
 }
 
+fn sandbox_has_stop_requested_label(sandbox: &Sandbox) -> bool {
+    sandbox
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.labels.get(STOP_REQUESTED_LABEL).map(String::as_str) == Some("true"))
+}
+
 fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
     if let Some(status) = status {
         if status.deleting {
@@ -2632,6 +2758,16 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
             | SandboxPhase::Ready
             | SandboxPhase::Unknown
     )
+}
+
+/// Whether `apply_sandbox_update_locked` should consider warning about a
+/// sandbox failing to become ready: only on the transition *into* `Error`,
+/// never on a repeated reconcile pass over a sandbox that was already
+/// `Error` (openlock-lai — an ungated warn produced ~687 identical log
+/// lines/day for one dead-but-still-listed sandbox, since the 60s reconcile
+/// sweep re-processes it forever without the phase ever changing).
+fn is_new_error_transition(old_phase: SandboxPhase, phase: SandboxPhase) -> bool {
+    old_phase != phase && phase == SandboxPhase::Error
 }
 
 fn is_terminal_failure_reason(reason: &str) -> bool {
@@ -5095,6 +5231,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_sandbox_update_maps_error_to_stopped_when_stop_requested() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "ContainerExited",
+                    "Container has exited",
+                ))),
+                workspace: "default".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Stopped,
+            "watch loop must surface intentional stop as Stopped, not Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_keeps_error_when_stop_label_absent() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "ContainerExited",
+                    "Container crashed",
+                ))),
+                workspace: "default".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error,
+            "absent stop-requested label must keep the crash signal as Error"
+        );
+    }
+
+    // `is_new_error_transition` gates the "Sandbox failed to become ready"
+    // warn (openlock-lai): an earlier version of this code fired that warn
+    // on every 60s reconcile re-processing of an already-`Error` sandbox,
+    // producing ~687 identical log lines/day for one dead-but-still-listed
+    // sandbox. These are plain pure-function assertions (no tracing
+    // subscriber / log capture) precisely because a log-capture test proved
+    // flaky under the shared, parallel `cargo test` binary: tracing's
+    // per-callsite interest cache is process-global, so a thread-local
+    // `set_default` subscriber can race with unrelated concurrently-running
+    // tests that exercise the same callsite under no subscriber at all.
+    #[test]
+    fn is_new_error_transition_true_on_transition_into_error() {
+        assert!(is_new_error_transition(
+            SandboxPhase::Ready,
+            SandboxPhase::Error
+        ));
+        assert!(is_new_error_transition(
+            SandboxPhase::Provisioning,
+            SandboxPhase::Error
+        ));
+    }
+
+    #[test]
+    fn is_new_error_transition_false_when_already_error() {
+        // This is the exact regression: a reconcile sweep re-processing an
+        // unchanged dead sandbox must not re-fire the warning.
+        assert!(!is_new_error_transition(
+            SandboxPhase::Error,
+            SandboxPhase::Error
+        ));
+    }
+
+    #[test]
+    fn is_new_error_transition_false_when_not_entering_error() {
+        assert!(!is_new_error_transition(
+            SandboxPhase::Error,
+            SandboxPhase::Ready
+        ));
+        assert!(!is_new_error_transition(
+            SandboxPhase::Provisioning,
+            SandboxPhase::Provisioning
+        ));
+    }
+
+    #[tokio::test]
     async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -5652,6 +5906,181 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_returns_not_found_when_sandbox_missing() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let err = runtime
+            .stop_sandbox("default", "does-not-exist")
+            .await
+            .expect_err("missing sandbox should fail");
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_succeeds_for_existing_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .stop_sandbox("default", "live")
+            .await
+            .expect("stop_sandbox should succeed");
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_stamps_stop_requested_label() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .stop_sandbox("default", "live")
+            .await
+            .expect("stop_sandbox should succeed");
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sandbox_has_stop_requested_label(&stored),
+            "stop_sandbox must stamp the stop-requested label so the watch loop maps ContainerExited→Stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_clears_stop_requested_label_on_success() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(true)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let mut sandbox = sandbox_record("sb-1", "live", SandboxPhase::Stopped);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("default", "live")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(started);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !sandbox_has_stop_requested_label(&stored),
+            "start_sandbox must clear the stop-requested label on successful resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_preserves_stop_requested_label_when_backend_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(false)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let mut sandbox = sandbox_record("sb-1", "ghost", SandboxPhase::Stopped);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert(STOP_REQUESTED_LABEL.to_string(), "true".to_string());
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("default", "ghost")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(!started);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sandbox_has_stop_requested_label(&stored),
+            "label must persist when resume hook reports backend missing — sandbox is still stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_returns_not_found_when_sandbox_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let err = runtime
+            .start_sandbox("default", "does-not-exist")
+            .await
+            .expect_err("missing sandbox should fail");
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(
+            resume.calls().await.is_empty(),
+            "resume should not be called when sandbox record is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_returns_unimplemented_without_resume_hook() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let err = runtime
+            .start_sandbox("default", "live")
+            .await
+            .expect_err("start without resume hook should fail");
+        assert_eq!(err.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_forwards_to_resume_hook() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(true)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let sandbox = sandbox_record("sb-1", "live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("default", "live")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(started);
+        assert_eq!(
+            resume.calls().await,
+            vec![("sb-1".to_string(), "live".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_reports_false_when_backend_resource_missing() {
+        let resume = Arc::new(RecordingResume::default());
+        resume.set_result("sb-1", Ok(false)).await;
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let sandbox = sandbox_record("sb-1", "ghost", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let started = runtime
+            .start_sandbox("default", "ghost")
+            .await
+            .expect("start_sandbox should succeed");
+        assert!(!started);
     }
 
     #[test]

@@ -45,10 +45,12 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
     RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
-    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
-    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
-    UpdateConfigResponse, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
-    UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
+    ServiceStatus, StartSandboxRequest, StartSandboxResponse, StopSandboxRequest,
+    StopSandboxResponse, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -313,6 +315,22 @@ impl OpenShell for OpenShellService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         sandbox::handle_delete_sandbox(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn stop_sandbox(
+        &self,
+        request: Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        sandbox::handle_stop_sandbox(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        sandbox::handle_start_sandbox(&self.state, request).await
     }
 
     // --- Exec ---

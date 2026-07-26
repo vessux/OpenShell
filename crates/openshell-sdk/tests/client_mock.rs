@@ -236,6 +236,20 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn stop_sandbox(
+        &self,
+        _: tonic::Request<proto::StopSandboxRequest>,
+    ) -> Result<Response<proto::StopSandboxResponse>, Status> {
+        Ok(Response::new(proto::StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _: tonic::Request<proto::StartSandboxRequest>,
+    ) -> Result<Response<proto::StartSandboxResponse>, Status> {
+        Ok(Response::new(proto::StartSandboxResponse { started: true }))
+    }
+
     async fn create_ssh_session(
         &self,
         _: tonic::Request<proto::CreateSshSessionRequest>,

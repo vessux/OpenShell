@@ -62,6 +62,10 @@ pub enum SandboxPhase {
     Error,
     Deleting,
     Unknown,
+    /// Compute backend is intentionally stopped (explicit Stop RPC).
+    /// Distinct from `Error` so reattach paths and external clients can
+    /// tell a user-requested halt from a crash. Cleared by the Start RPC.
+    Stopped,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -73,6 +77,7 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Error => Self::Error,
             proto::SandboxPhase::Deleting => Self::Deleting,
             proto::SandboxPhase::Unknown => Self::Unknown,
+            proto::SandboxPhase::Stopped => Self::Stopped,
         }
     }
 }

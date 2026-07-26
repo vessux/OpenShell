@@ -1514,6 +1514,31 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Stop a sandbox container without deleting it.
+    ///
+    /// Workspace volume, provider links, and the sandbox record survive.
+    /// Use `sandbox start` to bring it back live.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox names.
+        #[arg(required_unless_present = "all", num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        names: Vec<String>,
+
+        /// Stop all sandboxes.
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
+    },
+
+    /// Start a previously-stopped sandbox container.
+    ///
+    /// Idempotent: succeeds when the sandbox is already running.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        names: Vec<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -3115,6 +3140,12 @@ async fn main() -> Result<()> {
                                 &ctx.name,
                             )
                             .await?;
+                        }
+                        SandboxCommands::Stop { names, all } => {
+                            run::sandbox_stop(endpoint, &names, all, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { names } => {
+                            run::sandbox_start(endpoint, &names, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
