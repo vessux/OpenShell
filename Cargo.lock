@@ -3451,6 +3451,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "chrono",
  "ipnet",
@@ -3754,6 +3755,7 @@ dependencies = [
  "apollo-parser",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "flate2",
  "futures",
  "glob",

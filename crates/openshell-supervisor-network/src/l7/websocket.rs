@@ -546,7 +546,8 @@ fn inspect_websocket_text_message(
         query_params: inspector.query_params.clone(),
         graphql: None,
     };
-    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
+    let (allowed, reason) =
+        evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)?;
     let decision = match (allowed, inspector.enforcement) {
         (true, _) => "allow",
         (false, EnforcementMode::Audit) => "audit",
@@ -611,7 +612,7 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
-                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
+                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)?
             };
             let decision = match (allowed, inspector.enforcement) {
                 (_, _) if force_deny => "deny",
@@ -1273,6 +1274,10 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
         };
         let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);

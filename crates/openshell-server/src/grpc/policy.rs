@@ -5556,6 +5556,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -5769,6 +5770,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -5866,6 +5868,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -5980,6 +5983,7 @@ mod tests {
         // Step 1: mechanistic submits a broad L4 grant; the prover flags it
         // HIGH, so it lands in pending.
         let mechanistic_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "allow_api_github_com_443".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -6048,6 +6052,7 @@ mod tests {
         // validation verdict — supersede is unconditional on `(host, port,
         // binary)` overlap.
         let agent_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -6184,6 +6189,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6281,6 +6287,7 @@ mod tests {
         // L7-annotated (protocol: rest, enforce) but access: full — no
         // method/path bound. Credential in scope.
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_l7_full".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -6384,6 +6391,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6477,6 +6485,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6561,6 +6570,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6649,6 +6659,7 @@ mod tests {
         seed_global_approval_mode(&state, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6740,6 +6751,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -6826,6 +6838,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -6913,6 +6926,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -7009,6 +7023,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "example.com".to_string(),
@@ -7094,6 +7109,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "metadata_endpoint".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "169.254.169.254".to_string(),
@@ -7225,6 +7241,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -7349,6 +7366,7 @@ mod tests {
 
         // ── Step 1: un-credentialed GET → expected auto-approve ──
         let uncredentialed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_raw_openapi_get".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "raw.githubusercontent.com".to_string(),
@@ -7391,6 +7409,7 @@ mod tests {
 
         // ── Step 2: credentialed PUT → expected MEDIUM, pending ──
         let credentialed_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -7541,6 +7560,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
@@ -7649,6 +7669,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let submit_one = || {
             let state = state.clone();
@@ -7749,6 +7770,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -7880,6 +7902,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
 
         handle_submit_policy_analysis(
@@ -8077,6 +8100,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 
@@ -8105,6 +8129,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 
@@ -8133,6 +8158,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         };
 
@@ -8160,6 +8186,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-1".to_string(),
@@ -8228,6 +8255,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 },
             ))
             .collect(),
@@ -8256,6 +8284,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-merge".to_string(),
@@ -8329,6 +8358,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    allowed_secrets: vec![],
                 },
             ))
             .collect(),
@@ -8357,6 +8387,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: vec![],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-new".to_string(),
@@ -8493,6 +8524,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8514,6 +8546,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8532,6 +8565,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8550,6 +8584,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8561,6 +8596,7 @@ mod tests {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
 
         let rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "bad".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "METADATA.GOOGLE.INTERNAL.".to_string(),
@@ -8615,6 +8651,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -8632,6 +8669,7 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![],
+            allowed_secrets: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());

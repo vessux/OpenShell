@@ -1767,6 +1767,7 @@ pub async fn sandbox_create(
     labels: &HashMap<String, String>,
     environment: &HashMap<String, String>,
     approval_mode: &str,
+    log_level: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1849,7 +1850,7 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
-            ..SandboxSpec::default()
+            log_level: log_level.unwrap_or_default().to_string(),
         }),
         name: name.unwrap_or_default().to_string(),
         labels: labels.clone(),

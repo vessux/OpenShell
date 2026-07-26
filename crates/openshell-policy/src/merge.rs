@@ -985,6 +985,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -1003,6 +1004,7 @@ mod tests {
                 path: "/usr/bin/gh".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1028,6 +1030,7 @@ mod tests {
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![advisor_binary("/usr/bin/curl")],
@@ -1035,6 +1038,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
@@ -1063,6 +1067,7 @@ mod tests {
     #[test]
     fn add_rule_duplicate_binaries_prefer_user_declared_marker() {
         let incoming = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![
@@ -1097,6 +1102,7 @@ mod tests {
         policy.network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![endpoint("api.example.com", 443)],
                 binaries: vec![NetworkBinary {
@@ -1107,6 +1113,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "app-api".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "internal-admin.local".to_string(),
@@ -1443,6 +1450,7 @@ mod tests {
                     path: "/usr/bin/gh".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -1467,6 +1475,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let merged = merge_policy(
@@ -1490,6 +1499,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         // Merge an *unrelated* rule for a different host. The proposed rule
@@ -1520,6 +1530,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1532,6 +1543,7 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1563,6 +1575,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         // Endpoint exists in the policy but with a *different* binary. The
@@ -1578,6 +1591,7 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1614,6 +1628,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1633,6 +1648,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1660,6 +1676,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1682,6 +1699,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1705,6 +1723,7 @@ mod tests {
                 path: "/usr/bin/git".to_string(),
                 ..Default::default()
             }],
+            allowed_secrets: Vec::new(),
         };
 
         let merged = merge_policy(
@@ -1729,6 +1748,7 @@ mod tests {
             name: "any_binary_rule".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![],
+            allowed_secrets: Vec::new(),
         };
 
         let mut policy = restrictive_default_policy();
@@ -1741,6 +1761,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -1785,6 +1806,7 @@ mod tests {
         // `_provider_*` rule for api.github.com with `access: read-write`
         // and gh/git binaries.
         let provider_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "_provider_work_github".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -1816,6 +1838,7 @@ mod tests {
         // Agent submits a narrow PUT rule targeting the same host/port via
         // curl. Without the filter, this would merge into the provider rule.
         let agent_rule = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
@@ -1891,6 +1914,7 @@ mod tests {
         );
 
         let incoming = NetworkPolicyRule {
+            allowed_secrets: Vec::new(),
             name: "ignored_when_merging".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
