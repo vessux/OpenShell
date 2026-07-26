@@ -620,6 +620,7 @@ impl ProviderTypeProfile {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
+            allowed_secrets: Vec::new(),
         }
     }
 
@@ -1233,6 +1234,9 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         // Credential bindings reference a concrete sandbox provider instance
         // and therefore cannot be authored by a reusable provider profile.
         credential_binding: None,
+        cred_inject: None,
+        echo: false,
+        trust_check: None,
     }
 }
 

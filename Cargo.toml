@@ -122,6 +122,7 @@ tokio-stream = "0.1"
 protoc-bin-vendored = "3.2.0"
 url = "2"
 indexmap = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite", "migrate", "macros"] }

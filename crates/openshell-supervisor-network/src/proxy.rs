@@ -41,7 +41,7 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use self::destination::{
     DestinationDenial, DestinationDenialKind, DestinationRequest, build_validation_plan,
@@ -255,6 +255,7 @@ impl ProxyHandle {
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        trust_cache: Arc<crate::trust::TrustCache>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -396,9 +397,9 @@ impl ProxyHandle {
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
+                        let tc = trust_cache.clone();
                         tokio::spawn(async move {
-                            #[allow(clippy::large_futures)]
-                            if let Err(err) = handle_tcp_connection(
+                            if let Err(err) = Box::pin(handle_tcp_connection(
                                 stream,
                                 opa,
                                 cache,
@@ -414,7 +415,8 @@ impl ProxyHandle {
                                 dynamic_credentials,
                                 dtx,
                                 atx,
-                            )
+                                tc,
+                            ))
                             .await
                             {
                                 let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -717,6 +719,17 @@ async fn handle_transparent_tcp_connection(
         // policy-local context is absent.
         String::new(),
     );
+    // http_context() does not know about the fork's cred_inject/echo/trust
+    // fields (upstream-authored helper); populate them here so this transport
+    // gets the same per-binary-scoped credential filtering, strip-and-replace
+    // rewrite, and trust-check enforcement as the CONNECT/forward-HTTP paths.
+    // secret_resolver is already None on this path (no per-request resolver
+    // is threaded through transparent TCP), so filter_resolver_by_policy is a
+    // no-op here, but is still called for consistency/fail-closed-by-default.
+    ctx.secret_resolver = filter_resolver_by_policy(&opa_engine, &decision, &host, port, &None);
+    ctx.allowed_secrets = query_allowed_secrets_for_policy(&opa_engine, &decision, &host, port);
+    ctx.cred_inject = query_cred_inject_config(&opa_engine, &decision, &host, port);
+    ctx.trust_check = query_trust_check_config(&opa_engine, &decision, &host, port);
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
@@ -1704,6 +1717,7 @@ async fn handle_tcp_connection(
     >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -1768,6 +1782,7 @@ async fn handle_tcp_connection(
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
+            trust_cache,
         )
         .await;
     }
@@ -1956,6 +1971,149 @@ async fn handle_tcp_connection(
             return Ok(());
         }
     }
+
+    // Query L7 config early so we can detect echo mode before DNS resolution.
+    // `query_l7_route_snapshot` is a pure function of (engine, decision, host,
+    // port) — all four fixed above — so this single query also serves the
+    // non-echo path below; it is intentionally not re-queried later.
+    let l7_route = query_l7_route_snapshot(&decision, &host_lc, port);
+    let is_echo = l7_route
+        .as_ref()
+        .and_then(|route| route.configs.first())
+        .is_some_and(|snapshot| snapshot.config.echo);
+
+    if is_echo {
+        // Echo mode: skip DNS resolution and upstream connect entirely.
+        info!(
+            host = %host_lc,
+            port = port,
+            "ECHO mode active — skipping DNS/upstream, will return headers as JSON"
+        );
+
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+        {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "opa")
+                .message(format!("CONNECT_ECHO allowed {host_lc}:{port}"))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        let workspace = policy_local_ctx
+            .as_ref()
+            .map(|ctx| ctx.workspace())
+            .unwrap_or_default();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            workspace,
+            request_default_port: None,
+            policy_name: matched_policy.clone().unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            secret_resolver: filter_resolver_by_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+                &secret_resolver,
+            ),
+            provider_credentials,
+            provider_credential_revision: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+            agent_proposals: agent_proposals.clone(),
+            cred_inject: query_cred_inject_config(&opa_engine, &decision, &host_lc, port),
+            echo: true,
+            trust_cache: Some(trust_cache.clone()),
+            trust_check: query_trust_check_config(&opa_engine, &decision, &host_lc, port),
+            allowed_secrets: query_allowed_secrets_for_policy(
+                &opa_engine,
+                &decision,
+                &host_lc,
+                port,
+            ),
+        };
+
+        // Reuse the existing TLS/plaintext detection, but with a dummy upstream.
+        let (mut dummy_upstream, _dummy_rx) = tokio::io::duplex(1);
+
+        if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
+            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.l7_policy_generation)
+            {
+                Ok(engine) => engine,
+                Err(e) => {
+                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                    return Ok(());
+                }
+            };
+
+            // Peek to detect TLS vs plaintext (same logic as normal path).
+            let mut peek_buf = [0u8; 8];
+            let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            let l7_config = &route.configs[0].config;
+            if crate::l7::tls::looks_like_tls(&peek_buf[..n]) {
+                if let Some(ref tls) = tls_state {
+                    let mut tls_client =
+                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                    let _ = crate::l7::relay::relay_with_inspection(
+                        l7_config,
+                        tunnel_engine,
+                        &mut tls_client,
+                        &mut dummy_upstream,
+                        &ctx,
+                    )
+                    .await;
+                }
+            } else {
+                let _ = crate::l7::relay::relay_with_inspection(
+                    l7_config,
+                    tunnel_engine,
+                    &mut client,
+                    &mut dummy_upstream,
+                    &ctx,
+                )
+                .await;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Note: allowed_ips resolution (including the implicit-IP-host fallback)
+    // now happens inside `hydrate_destination_plan` above -- it already
+    // queries `query_allowed_ips` and builds the validation plan from it, so
+    // there is no separate allowlist computation to do here anymore.
     let destination_plan = decision
         .endpoint
         .destination
@@ -2160,6 +2318,22 @@ async fn handle_tcp_connection(
         agent_proposals,
         workspace,
     );
+    // http_context() does not know about the fork's cred_inject/echo/trust
+    // fields; populate them here from the same generation-pinned `decision`
+    // so credential resolution stays per-binary-scoped and cred_inject/trust
+    // enforcement runs on the CONNECT/forward-HTTP path exactly as before
+    // this rebase. Never let a request reach the L7 proxy with an
+    // unfiltered resolver -- filter_resolver_by_policy fails closed
+    // (returns None) when the calling binary isn't in `allowed_secrets`.
+    ctx.secret_resolver =
+        filter_resolver_by_policy(&opa_engine, &decision, &host_lc, port, &secret_resolver);
+    ctx.allowed_secrets = query_allowed_secrets_for_policy(&opa_engine, &decision, &host_lc, port);
+    ctx.cred_inject = query_cred_inject_config(&opa_engine, &decision, &host_lc, port);
+    ctx.echo = l7_route
+        .and_then(|route| route.configs.first())
+        .is_some_and(|snapshot| snapshot.config.echo);
+    ctx.trust_cache = Some(trust_cache.clone());
+    ctx.trust_check = query_trust_check_config(&opa_engine, &decision, &host_lc, port);
 
     if effective_tls_skip {
         // Policy validation rejects fail-closed middleware overlapping
@@ -3527,6 +3701,192 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|snapshot| snapshot.config.path_specificity())
 }
 
+/// Query `cred_inject` config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(CredInjectConfig)` if the matched endpoint has `cred_inject` config,
+/// `None` otherwise.
+fn query_cred_inject_config(
+    engine: &OpaEngine,
+    decision: &EgressDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::CredInjectConfig> {
+    // Only query if action is Allow (not Deny)
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_cred_inject_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query cred_inject endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+/// Query `trust_check` config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(TrustCheckConfig)` if the matched endpoint has `trust_check` config,
+/// `None` otherwise.
+fn query_trust_check_config(
+    engine: &OpaEngine,
+    decision: &EgressDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::TrustCheckConfig> {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_trust_check_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query trust_check endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+/// Query OPA for `allowed_secrets` and return a filtered `SecretResolver`.
+///
+/// If the matched policy has no `allowed_secrets` constraint (or the list is
+/// empty), the full resolver is returned unchanged so the behaviour is
+/// backward-compatible.  On OPA error the full resolver is also returned and
+/// the failure is emitted as an OCSF event.
+/// Fork: query the per-binary `allowed_secrets` list policy establishes for
+/// this (binary, host, port), for storage in `L7EvalContext::allowed_secrets`
+/// so the endpoint-scoped resolver built per request in
+/// `scoped_context_for_request` is filtered too.
+///
+/// - `Some(keys)`: the exact list from OPA (`Some(vec![])` = the documented
+///   "empty = no restriction" semantics; also used when no policy matched,
+///   mirroring `filter_resolver_by_policy`).
+/// - `None`: the OPA query failed. Consumers fail closed (no resolver).
+fn query_allowed_secrets_for_policy(
+    engine: &OpaEngine,
+    decision: &EgressDecision,
+    host: &str,
+    port: u16,
+) -> Option<Vec<String>> {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return Some(Vec::new());
+    }
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+    match engine.query_allowed_secrets(&input) {
+        Ok(allowed) => Some(allowed),
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!(
+                    "Failed to query allowed_secrets (endpoint-scoped credentials fail closed): {e}"
+                ))
+                .build();
+            ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+fn filter_resolver_by_policy(
+    engine: &OpaEngine,
+    decision: &EgressDecision,
+    host: &str,
+    port: u16,
+    resolver: &Option<Arc<SecretResolver>>,
+) -> Option<Arc<SecretResolver>> {
+    let resolver = resolver.as_ref()?;
+
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return Some(Arc::clone(resolver));
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_allowed_secrets(&input) {
+        Ok(allowed) if !allowed.is_empty() => Some(Arc::new(resolver.filtered(&allowed))),
+        Ok(_) => Some(Arc::clone(resolver)),
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query allowed_secrets: {e}"))
+                .build();
+            ocsf_emit!(event);
+            Some(Arc::clone(resolver))
+        }
+    }
+}
+
 /// Query the TLS mode for an endpoint, independent of L7 config.
 ///
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
@@ -4772,6 +5132,12 @@ where
             signing_region: options.signing_region,
             host: options.host,
             port: options.port,
+            // This request's bytes were already rewritten by the caller
+            // (function name: relay_rewritten_forward_request) before it
+            // reached here -- any cred_inject strip-and-replace already ran
+            // upstream of this call. `ForwardRelayOptions` carries no
+            // cred_inject field, so there is nothing to thread through.
+            cred_inject: None,
         },
     )
     .await
@@ -4836,6 +5202,7 @@ async fn handle_forward_proxy(
     >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    trust_cache: Arc<crate::trust::TrustCache>,
 ) -> Result<()> {
     let mut telemetry_path = forward_telemetry_path(target_uri);
     // 1. Parse the absolute-form URI. Every external forward target is
@@ -5137,6 +5504,24 @@ async fn handle_forward_proxy(
         "https" => Some(443),
         _ => None,
     };
+    // http_context() does not know about the fork's cred_inject/echo/trust
+    // fields; populate them here, mirroring the CONNECT path above. Never let
+    // a forwarded request reach the L7 proxy with an unfiltered resolver --
+    // filter_resolver_by_policy fails closed when the calling binary isn't in
+    // `allowed_secrets`.
+    l7_ctx.secret_resolver =
+        filter_resolver_by_policy(&opa_engine, &decision, &host_lc, port, &secret_resolver);
+    l7_ctx.allowed_secrets =
+        query_allowed_secrets_for_policy(&opa_engine, &decision, &host_lc, port);
+    l7_ctx.cred_inject = query_cred_inject_config(&opa_engine, &decision, &host_lc, port);
+    l7_ctx.echo = decision
+        .endpoint
+        .l7_route
+        .as_ref()
+        .is_some_and(|r| r.configs.iter().any(|s| s.config.echo));
+    l7_ctx.trust_cache = Some(trust_cache.clone());
+    l7_ctx.trust_check = query_trust_check_config(&opa_engine, &decision, &host_lc, port);
+
     if let Some(route) = decision
         .endpoint
         .l7_route
@@ -5447,9 +5832,11 @@ async fn handle_forward_proxy(
         let hard_deny_reason =
             crate::l7::relay::l7_request_hard_deny_reason(l7_config.config.protocol, &request_info);
         let force_deny = hard_deny_reason.is_some();
+        // FORWARD path: trust pre-flight intentionally not applied here — trust
+        // fires inside relay paths (relay.rs) before any wire I/O.
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
-                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info, None)
                     .unwrap_or_else(|e| {
                         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
@@ -6535,6 +6922,9 @@ network_policies: {}
             None,
             None,
             None,
+            Arc::new(crate::trust::TrustCache::new(
+                std::time::Duration::from_secs(3600),
+            )),
         ))
         .await
         .expect("malformed request should be handled");
@@ -6647,6 +7037,9 @@ network_policies:
                 None,
                 None,
                 None,
+                Arc::new(crate::trust::TrustCache::new(
+                    std::time::Duration::from_secs(3600),
+                )),
             ),
         )
         .await
@@ -6780,6 +7173,9 @@ network_policies:
                 None,
                 None,
                 None,
+                Arc::new(crate::trust::TrustCache::new(
+                    std::time::Duration::from_secs(3600),
+                )),
             )
             .await
         });
@@ -7315,6 +7711,7 @@ network_policies:
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
             signing_region: String::new(),
+            echo: false,
         }
     }
 
@@ -7997,6 +8394,12 @@ network_policies:
         let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
         let fixture = forward_token_grant_fixture(provider_key, resolver_response, false);
         let ctx = crate::l7::relay::L7EvalContext {
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+            allowed_secrets: Some(Vec::new()),
+
             host: "api.example.test".into(),
             port: 8080,
             request_default_port: Some(8080),
@@ -8554,6 +8957,7 @@ network_policies:
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
                     signing_region: String::new(),
+                    echo: false,
                 },
             },
             L7ConfigSnapshot {
@@ -8574,6 +8978,7 @@ network_policies:
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
                     signing_region: String::new(),
+                    echo: false,
                 },
             },
         ];
@@ -12105,6 +12510,9 @@ network_policies:
                 None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
                 None,                      // activity_tx
+                Arc::new(crate::trust::TrustCache::new(
+                    std::time::Duration::from_secs(3600),
+                )), // trust_cache
             )),
         )
         .await
@@ -12172,6 +12580,9 @@ network_policies:
             None,
             Some(denial_tx),
             None,
+            Arc::new(crate::trust::TrustCache::new(
+                std::time::Duration::from_secs(3600),
+            )),
         ))
         .await
         .expect("forward handler should complete");

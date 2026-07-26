@@ -89,6 +89,23 @@ pub(super) fn http_context(
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
         workspace,
+        // Fork fields: left at their fail-closed defaults here. `http_context`
+        // is an upstream-authored helper with no access to the OPA engine or
+        // (host, port), so it cannot itself query cred_inject/trust_check or
+        // filter the resolver through `filter_resolver_by_policy`. Every
+        // caller of `http_context` MUST overwrite `secret_resolver`,
+        // `cred_inject`, and `trust_check` immediately afterward via
+        // `filter_resolver_by_policy` / `query_cred_inject_config` /
+        // `query_trust_check_config` -- do not add a new call site that skips
+        // that step.
+        cred_inject: None,
+        echo: false,
+        trust_cache: None,
+        trust_check: None,
+        // Fork: never established here -- callers MUST set it (via
+        // `query_allowed_secrets_for_policy`) or endpoint-scoped resolution
+        // fails closed in `scoped_context_for_request`.
+        allowed_secrets: None,
     }
 }
 
@@ -358,6 +375,11 @@ mod tests {
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
+            cred_inject: None,
+            echo: false,
+            trust_cache: None,
+            trust_check: None,
+            allowed_secrets: None,
         }
     }
 
@@ -418,6 +440,7 @@ mod tests {
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
                     signing_region: String::new(),
+                    echo: false,
                 },
             }],
             l7_policy_generation: engine.current_generation(),

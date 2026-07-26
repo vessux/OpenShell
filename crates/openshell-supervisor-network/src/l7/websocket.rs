@@ -1381,8 +1381,9 @@ fn inspect_websocket_text_message(
         graphql: None,
         jsonrpc: None,
     };
-    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
-        .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?;
+    let (allowed, reason) =
+        evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)
+            .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?;
     let decision = match (allowed, inspector.enforcement) {
         (true, _) => "allow",
         (false, EnforcementMode::Audit) => "audit",
@@ -1452,7 +1453,7 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
-                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
+                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info, None)
                     .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?
             };
             let decision = match (allowed, inspector.enforcement) {

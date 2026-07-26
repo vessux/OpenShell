@@ -554,6 +554,9 @@ network_policies:
                                     None,
                                     None,
                                     None,
+                                    Arc::new(crate::trust::TrustCache::new(
+                                        std::time::Duration::from_secs(3600),
+                                    )),
                                 ))
                                 .await
                                 .unwrap();

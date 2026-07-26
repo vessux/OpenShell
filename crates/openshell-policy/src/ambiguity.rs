@@ -734,6 +734,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         policy.network_policies.insert(
@@ -745,6 +746,7 @@ mod tests {
                     path: "/usr/bin/bash".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         policy

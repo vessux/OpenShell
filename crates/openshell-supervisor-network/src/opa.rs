@@ -1046,6 +1046,56 @@ impl OpaEngine {
         Ok(val == regorus::Value::from(true))
     }
 
+    /// Query `matched_allowed_secrets` from the OPA policy for a given request.
+    ///
+    /// Returns the list of credential key names that the binary is allowed to
+    /// access, or an empty vec if the rule is undefined or returns no values.
+    /// Used by the proxy to scope `SecretResolver` to only the permitted keys.
+    pub fn query_allowed_secrets(&self, input: &NetworkInput) -> Result<Vec<String>> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.matched_allowed_secrets".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Array(arr) => Ok(arr
+                .iter()
+                .filter_map(|v| v.as_string().ok().map(ToString::to_string))
+                .collect()),
+            _ => Ok(vec![]),
+        }
+    }
+
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
     ///
     /// With the `arc` feature enabled, this shares compiled policy via Arc
@@ -2067,6 +2117,32 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 allow_all_known_mcp_methods.into();
                         }
                     }
+                    if let Some(ref ci) = e.cred_inject {
+                        let inject: Vec<serde_json::Value> = ci
+                            .inject
+                            .iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "header": h.header,
+                                    "from_credential": h.from_credential,
+                                    "value_prefix": h.value_prefix,
+                                })
+                            })
+                            .collect();
+                        ep["cred_inject"] = serde_json::json!({
+                            "provider": ci.provider,
+                            "strip_headers": ci.strip_headers,
+                            "inject": inject,
+                        });
+                    }
+                    if e.echo {
+                        ep["echo"] = true.into();
+                    }
+                    if let Some(ref tc) = e.trust_check {
+                        ep["trust_check"] = serde_json::json!({
+                            "registry": tc.registry,
+                        });
+                    }
                     ep
                 })
                 .collect();
@@ -2227,6 +2303,7 @@ mod tests {
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         network_policies.insert(
@@ -2242,6 +2319,7 @@ mod tests {
                     path: "/usr/bin/glab".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         ProtoSandboxPolicy {
@@ -3170,6 +3248,19 @@ process:
         val == regorus::Value::from(true)
     }
 
+    /// Evaluate an arbitrary `data.openshell.sandbox.<rule>` boolean rule
+    /// (e.g. `deny_trust_critical`, `audit_trust_critical_inexact`) against
+    /// the given input. Unlike `eval_l7`, this doesn't assume the rule name
+    /// is `allow_request`.
+    fn eval_rule_bool(engine: &OpaEngine, input: &serde_json::Value, rule: &str) -> bool {
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule(format!("data.openshell.sandbox.{rule}"))
+            .unwrap();
+        val == regorus::Value::from(true)
+    }
+
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
         let mut engine = regorus::Engine::new();
         engine
@@ -3233,6 +3324,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3584,6 +3676,109 @@ network_policies:
         assert!(!eval_l7(&engine, &input));
     }
 
+    // --- openlock fork: trust_check (openlock-1ft) ---
+    //
+    // Coverage for the exactness gate on `deny_trust_critical`: a critical
+    // vulnerability on a version that was actually requested must still
+    // deny; the same finding against a version merely defaulted from a
+    // versionless request (e.g. an npm packument GET for a self-update
+    // check) must be allowed-with-audit instead, never a hard deny.
+
+    fn trust_json(critical_vulns: u32, version_is_exact: bool) -> serde_json::Value {
+        serde_json::json!({
+            "package": "@anthropic-ai/claude-code",
+            "version": "2.1.98",
+            "version_is_exact": version_is_exact,
+            "registry": "npm",
+            "critical_vulns": critical_vulns,
+            "high_vulns": 0,
+            "medium_vulns": 0,
+            "low_vulns": 0,
+            "license": "MIT",
+            "is_stale": false,
+            "lookup_failed": false,
+        })
+    }
+
+    #[test]
+    fn trust_critical_exact_version_is_denied() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(1, true);
+        assert!(
+            eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "exact-version critical finding should set deny_trust_critical"
+        );
+        assert!(
+            !eval_rule_bool(&engine, &input, "audit_trust_critical_inexact"),
+            "exact-version critical finding must not also be classified as audit-only"
+        );
+        assert!(
+            !eval_l7(&engine, &input),
+            "request naming a version with a critical vulnerability must be denied"
+        );
+    }
+
+    #[test]
+    fn trust_critical_defaulted_version_is_audited_not_denied() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(1, false);
+        assert!(
+            !eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "a defaulted (non-exact) version must never trigger deny_trust_critical"
+        );
+        assert!(
+            eval_rule_bool(&engine, &input, "audit_trust_critical_inexact"),
+            "a defaulted (non-exact) version with a critical finding should be audit-flagged"
+        );
+        assert!(
+            eval_l7(&engine, &input),
+            "a versionless request must not be denied on a version nobody asked for"
+        );
+    }
+
+    #[test]
+    fn trust_critical_missing_exactness_field_fails_closed_to_deny() {
+        // No `version_is_exact` key at all -- must NOT silently degrade to
+        // allow-everything. Absence falls to the restrictive branch (treated
+        // as exact, still denied), same "absent != empty" direction as the
+        // credential moat's `allowed_secrets` field.
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = serde_json::json!({
+            "package": "@anthropic-ai/claude-code",
+            "version": "2.1.98",
+            "registry": "npm",
+            "critical_vulns": 1,
+            "high_vulns": 0,
+            "medium_vulns": 0,
+            "low_vulns": 0,
+            "license": "MIT",
+            "is_stale": false,
+            "lookup_failed": false,
+        });
+        assert!(
+            eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "an absent version_is_exact must fail closed (still deny), not fail open"
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn trust_no_vulns_is_allowed_regardless_of_exactness() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(0, false);
+        assert!(eval_l7(&engine, &input));
+        assert!(!eval_rule_bool(&engine, &input, "deny_trust_critical"));
+        assert!(!eval_rule_bool(
+            &engine,
+            &input,
+            "audit_trust_critical_inexact"
+        ));
+    }
+
     #[test]
     fn l7_endpoint_path_scopes_rest_and_graphql_on_same_host() {
         let data = r#"
@@ -3771,6 +3966,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -3843,6 +4039,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -3916,6 +4113,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -4869,6 +5067,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4927,6 +5126,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4986,6 +5186,7 @@ network_policies:
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5047,6 +5248,7 @@ network_policies:
                     path: "/usr/local/bin/aws".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5107,6 +5309,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5238,6 +5441,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         policy.network_policies.insert(
@@ -5253,6 +5457,7 @@ network_policies:
                     path: "/usr/bin/bash".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -6407,6 +6612,7 @@ network_policies:
         network_policies.insert(
             "allow_mcp_internal_corp_example_com_8443".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "allow_mcp_internal_corp_example_com_8443".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "mcp-internal.corp.example.com".to_string(),
@@ -6457,6 +6663,7 @@ network_policies:
         network_policies.insert(
             "app-api".to_string(),
             NetworkPolicyRule {
+                allowed_secrets: Vec::new(),
                 name: "app-api".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "internal-admin.local".to_string(),
@@ -6540,6 +6747,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6771,6 +6979,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -7742,6 +7951,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
                 binaries: candidates
                     .iter()
                     .map(|p| NetworkBinary {
@@ -7808,6 +8018,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -7882,6 +8093,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         let registry = MiddlewareRegistry::connect_services(
@@ -8089,6 +8301,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                allowed_secrets: Vec::new(),
             },
         );
         engine
@@ -8382,6 +8595,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -8460,6 +8674,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {

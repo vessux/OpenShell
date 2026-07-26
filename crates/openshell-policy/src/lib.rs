@@ -26,9 +26,9 @@ pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    CredInjectConfig, CredInjectHeader, FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule,
+    L7QueryMatcher, L7Rule, LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint,
+    NetworkPolicyRule, ProcessPolicy, SandboxPolicy, TrustCheckConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,8 @@ struct NetworkPolicyRuleDef {
     endpoints: Vec<NetworkEndpointDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binaries: Vec<NetworkBinaryDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_secrets: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,6 +177,47 @@ struct NetworkEndpointDef {
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+    /// Optional credential injection config. When present, the L7 proxy strips
+    /// the specified headers and injects provider-managed credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cred_inject: Option<CredInjectDef>,
+    /// When true, the proxy returns post-rewrite headers as JSON instead of
+    /// forwarding upstream. For wire proof testing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    echo: bool,
+    /// Optional trust check config. When set, the proxy queries deps.dev for
+    /// vulnerability/license data before allowing package downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_check: Option<TrustCheckDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strip_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inject: Vec<CredInjectHeaderDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredInjectHeaderDef {
+    header: String,
+    from_credential: String,
+    // openlock fork delta: literal prefix prepended to the resolved credential
+    // value (e.g. "Bearer "). Optional — empty/absent = no prefix (back-compat).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    value_prefix: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustCheckDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registry: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -791,6 +834,23 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
                             mcp: mcp_options(&e.mcp),
+                            cred_inject: e.cred_inject.map(|ci| CredInjectConfig {
+                                provider: ci.provider,
+                                strip_headers: ci.strip_headers,
+                                inject: ci
+                                    .inject
+                                    .into_iter()
+                                    .map(|h| CredInjectHeader {
+                                        header: h.header,
+                                        from_credential: h.from_credential,
+                                        value_prefix: h.value_prefix,
+                                    })
+                                    .collect(),
+                            }),
+                            echo: e.echo,
+                            trust_check: e.trust_check.map(|tc| TrustCheckConfig {
+                                registry: tc.registry,
+                            }),
                         }
                     })
                     .collect(),
@@ -802,6 +862,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                         ..Default::default()
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets,
             };
             (key, proto_rule)
         })
@@ -945,6 +1006,23 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             }),
                             json_rpc,
                             mcp,
+                            cred_inject: e.cred_inject.as_ref().map(|ci| CredInjectDef {
+                                provider: ci.provider.clone(),
+                                strip_headers: ci.strip_headers.clone(),
+                                inject: ci
+                                    .inject
+                                    .iter()
+                                    .map(|h| CredInjectHeaderDef {
+                                        header: h.header.clone(),
+                                        from_credential: h.from_credential.clone(),
+                                        value_prefix: h.value_prefix.clone(),
+                                    })
+                                    .collect(),
+                            }),
+                            echo: e.echo,
+                            trust_check: e.trust_check.as_ref().map(|tc| TrustCheckDef {
+                                registry: tc.registry.clone(),
+                            }),
                         }
                     })
                     .collect(),
@@ -956,6 +1034,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         harness: false,
                     })
                     .collect(),
+                allowed_secrets: rule.allowed_secrets.clone(),
             };
             (key.clone(), yaml_rule)
         })
@@ -1212,6 +1291,13 @@ pub enum PolicyViolation {
         endpoint_index: usize,
         reason: String,
     },
+    /// `credential_signing` and `cred_inject` are both set (fork addition).
+    CredentialSigningWithCredInject { policy_name: String, host: String },
+    /// `allow_uninspected_credentials` and `cred_inject` are both set on the
+    /// same endpoint (fork addition). An endpoint that is explicitly excused
+    /// from L7 inspection cannot also declare a `cred_inject` rewrite — the
+    /// rewrite could never run, so the credential would ride uninspected.
+    AllowUninspectedCredentialsWithCredInject { policy_name: String, host: String },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
@@ -1354,6 +1440,27 @@ impl fmt::Display for PolicyViolation {
                 f,
                 "network policy '{policy_name}': endpoint {endpoint_index} has invalid L7 configuration: {reason}"
             ),
+            Self::CredentialSigningWithCredInject { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
+                     and cred_inject set; these options are mutually exclusive. SigV4 signing \
+                     computes its signature over the pre-cred_inject request, so cred_inject's \
+                     strip-and-replace would be silently discarded on this endpoint. SigV4 \
+                     resolves its own AWS credentials through the same per-binary-scoped \
+                     resolver, so drop cred_inject here."
+                )
+            }
+            Self::AllowUninspectedCredentialsWithCredInject { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has both \
+                     allow_uninspected_credentials and cred_inject set; these options are \
+                     mutually exclusive. allow_uninspected_credentials tells the L7 proxy to skip \
+                     inspection/rewrite on this endpoint, so cred_inject's strip-and-replace would \
+                     never run and the caller-supplied credential would ride uninspected."
+                )
+            }
             Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
             }
@@ -1693,6 +1800,29 @@ pub fn validate_sandbox_policy(
                     reason,
                 }
             }));
+            // Fork addition: SigV4 signs the request as it stood *before*
+            // cred_inject ran, so configuring both silently drops
+            // cred_inject's strip-and-replace on this endpoint -- the
+            // agent's own credential headers would survive unstripped.
+            // Reject at load rather than fail open at runtime.
+            if !ep.credential_signing.is_empty() && ep.cred_inject.is_some() {
+                violations.push(PolicyViolation::CredentialSigningWithCredInject {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            // Fork addition: allow_uninspected_credentials tells the L7 proxy
+            // to skip inspection/rewrite on this endpoint entirely, so a
+            // cred_inject rewrite configured on the same endpoint could never
+            // run -- the caller-supplied credential would ride uninspected
+            // instead of being stripped-and-replaced. Reject at load rather
+            // than fail open at runtime, mirroring the SigV4 guard above.
+            if ep.allow_uninspected_credentials && ep.cred_inject.is_some() {
+                violations.push(PolicyViolation::AllowUninspectedCredentialsWithCredInject {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
         }
     }
 
@@ -2504,6 +2634,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -2535,6 +2666,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -2559,6 +2691,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -2587,6 +2720,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -2769,6 +2903,7 @@ network_policies:
                         ..Default::default()
                     }],
                     binaries: Vec::new(),
+                    allowed_secrets: Vec::new(),
                 },
             );
 
@@ -2811,6 +2946,7 @@ network_policies:
                         ..Default::default()
                     }],
                     binaries: Vec::new(),
+                    allowed_secrets: Vec::new(),
                 },
             );
 
@@ -2843,6 +2979,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -2869,6 +3006,7 @@ network_policies:
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
+                allowed_secrets: Vec::new(),
             },
         );
 
@@ -3258,6 +3396,86 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::CredentialSigningWithBodyRewrite { .. }))
         );
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_with_cred_inject() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    cred_inject: Some(CredInjectConfig {
+                        provider: "anthropic".into(),
+                        strip_headers: vec!["authorization".into()],
+                        inject: vec![],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::CredentialSigningWithCredInject { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_allow_uninspected_credentials_with_cred_inject() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "provider".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.anthropic.com".into(),
+                    port: 443,
+                    allow_uninspected_credentials: true,
+                    cred_inject: Some(CredInjectConfig {
+                        provider: "anthropic".into(),
+                        strip_headers: vec!["authorization".into()],
+                        inject: vec![],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::AllowUninspectedCredentialsWithCredInject { .. }
+        )));
+    }
+
+    #[test]
+    fn validate_allows_credential_signing_without_cred_inject() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        // SigV4 alone is the supported Bedrock shape: it resolves its own AWS
+        // credentials through the per-binary-scoped resolver.
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -4062,5 +4280,110 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn allowed_secrets_round_trips_through_proto() {
+        let yaml = r"
+version: 1
+network_policies:
+  github_only:
+    binaries:
+      - path: /usr/bin/gh
+    endpoints:
+      - host: api.github.com
+        port: 443
+    allowed_secrets:
+      - GITHUB_TOKEN
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let rule = &proto.network_policies["github_only"];
+        assert_eq!(rule.allowed_secrets, vec!["GITHUB_TOKEN"]);
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto2.network_policies["github_only"].allowed_secrets,
+            vec!["GITHUB_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn cred_inject_round_trips_through_proto() {
+        let yaml = r"
+version: 1
+network_policies:
+  anthropic_strict:
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        cred_inject:
+          provider: anthropic-prod
+          strip_headers:
+            - Authorization
+            - x-api-key
+            - Cookie
+          inject:
+            - header: x-api-key
+              from_credential: ANTHROPIC_API_KEY
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["anthropic_strict"].endpoints[0];
+
+        let ci = ep.cred_inject.as_ref().expect("cred_inject should be set");
+        assert_eq!(ci.provider, "anthropic-prod");
+        assert_eq!(
+            ci.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci.inject.len(), 1);
+        assert_eq!(ci.inject[0].header, "x-api-key");
+        assert_eq!(ci.inject[0].from_credential, "ANTHROPIC_API_KEY");
+
+        // Round-trip: serialize back to YAML and re-parse.
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep2 = &proto2.network_policies["anthropic_strict"].endpoints[0];
+        let ci2 = ep2
+            .cred_inject
+            .as_ref()
+            .expect("cred_inject should survive round-trip");
+        assert_eq!(ci2.provider, "anthropic-prod");
+        assert_eq!(
+            ci2.strip_headers,
+            vec!["Authorization", "x-api-key", "Cookie"]
+        );
+        assert_eq!(ci2.inject.len(), 1);
+        assert_eq!(ci2.inject[0].header, "x-api-key");
+        assert_eq!(ci2.inject[0].from_credential, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn trust_check_round_trips_through_proto() {
+        let yaml = r"
+version: 1
+network_policies:
+  pip:
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        trust_check:
+          registry: pypi
+";
+        let policy = parse_sandbox_policy(yaml).unwrap();
+        let ep = &policy.network_policies["pip"].endpoints[0];
+        let tc = ep.trust_check.as_ref().expect("trust_check should be set");
+        assert_eq!(tc.registry, "pypi");
+
+        let yaml_back = serialize_sandbox_policy(&policy).unwrap();
+        let policy2 = parse_sandbox_policy(&yaml_back).unwrap();
+        let tc2 = policy2.network_policies["pip"].endpoints[0]
+            .trust_check
+            .as_ref()
+            .expect("trust_check should survive round-trip");
+        assert_eq!(tc2.registry, "pypi");
     }
 }

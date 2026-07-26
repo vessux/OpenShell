@@ -19,6 +19,7 @@ pub mod proxy;
 pub mod run;
 pub mod sigv4;
 mod token_grant;
+pub mod trust;
 pub mod upstream_proxy;
 
 #[cfg(test)]

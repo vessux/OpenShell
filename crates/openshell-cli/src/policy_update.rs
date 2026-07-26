@@ -65,6 +65,7 @@ pub fn build_policy_update_plan(
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         };
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::AddRule(AddNetworkRule {

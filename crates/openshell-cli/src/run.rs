@@ -386,6 +386,11 @@ pub struct SandboxCreateConfig<'a> {
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
+    /// Supervisor log level for this sandbox (trace, debug, info, warn, error).
+    /// Sets `SandboxSpec.log_level`; the driver passes it as
+    /// `OPENSHELL_LOG_LEVEL` to the in-container supervisor. Debug surfaces
+    /// the L7 egress request/response header lines in the proxy log.
+    pub log_level: Option<&'a str>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -411,6 +416,7 @@ impl Default for SandboxCreateConfig<'_> {
             approval_mode: "manual",
             output: "table",
             detach: false,
+            log_level: None,
         }
     }
 }
@@ -444,6 +450,7 @@ pub async fn sandbox_create(
         approval_mode,
         output,
         detach,
+        log_level,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -547,6 +554,7 @@ pub async fn sandbox_create(
             template,
             command: main_command,
             tty: main_terminal,
+            log_level: log_level.unwrap_or_default().to_string(),
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),

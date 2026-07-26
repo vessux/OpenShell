@@ -52,6 +52,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+arc-swap = "1"
 tempfile = "3"
 
 [lints]

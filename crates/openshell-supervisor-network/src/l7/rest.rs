@@ -690,7 +690,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -698,12 +698,36 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None, cred_inject)
+        .await
+}
+
+/// Apply optional `cred_inject` (strip + inject) over already-rewritten header
+/// bytes. Returns the original bytes unchanged when no strip/inject directive
+/// is configured. `error_tag` is prepended to the failure message so callers
+/// can distinguish forward vs echo paths in logs.
+fn apply_cred_inject_or_default(
+    rewritten: Vec<u8>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+    resolver: Option<&SecretResolver>,
+    error_tag: &str,
+) -> Result<Vec<u8>> {
+    let Some(ci) = cred_inject else {
+        return Ok(rewritten);
+    };
+    if ci.strip_headers.is_empty() && ci.inject.is_empty() {
+        return Ok(rewritten);
+    }
+    let empty_resolver = SecretResolver::default();
+    let r = resolver.unwrap_or(&empty_resolver);
+    openshell_core::secrets::apply_cred_inject(&rewritten, &ci.strip_headers, &ci.inject, r)
+        .map_err(|e| miette!("{error_tag}cred_inject failed: {e}"))
 }
 
 pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
@@ -712,6 +736,7 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     upstream: &mut U,
     resolver: Option<&SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -733,6 +758,7 @@ where
             signing_region: "",
             host: "",
             port: 0,
+            cred_inject,
         },
     )
     .await
@@ -758,6 +784,7 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+    pub(crate) cred_inject: Option<&'a crate::l7::CredInjectConfig>,
 }
 
 #[derive(Clone, Copy)]
@@ -846,6 +873,42 @@ where
 
     let rewrite_result =
         rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+
+    // `rewrite_result.rewritten` is cloned rather than moved because the SigV4
+    // signing branch below (`options.credential_signing.is_sigv4()`) needs the
+    // pre-cred_inject bytes to compute the AWS signature, while cred_inject
+    // needs them to produce `final_header`.
+    //
+    // INVARIANT: an endpoint can never have both `credential_signing` and
+    // `cred_inject` set — `validate_sandbox_policy` rejects that combination at
+    // policy load (`PolicyViolation::CredentialSigningWithCredInject`). It must,
+    // because SigV4 signs the request as it stood *before* cred_inject ran, so
+    // allowing both would silently discard cred_inject's strip-and-replace and
+    // forward an agent-supplied credential header unstripped. SigV4 resolves its
+    // own AWS credentials through the same per-binary-scoped resolver, so it
+    // needs no help from cred_inject. If that validation is ever relaxed, this
+    // branch must be reworked to sign `final_header` instead.
+    let final_header = apply_cred_inject_or_default(
+        rewrite_result.rewritten.clone(),
+        options.cred_inject,
+        options.resolver,
+        "",
+    )?;
+
+    // Egress observability (DEBUG-gated, OFF by default): surface the
+    // billing-relevant request header `anthropic-beta` (carries
+    // `oauth-2025-04-20` in Claude subscription mode) for testing. The
+    // `enabled!` guard avoids parsing the header block when debug is off.
+    // NEVER logs Authorization / any credential header — only `anthropic-beta`.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for line in String::from_utf8_lossy(&final_header).lines().skip(1) {
+            if line.to_ascii_lowercase().starts_with("anthropic-beta:") {
+                // Embed the value in the message (not a structured field) so it
+                // renders in the shorthand log that `openlock logs` surfaces.
+                debug!("l7 egress request header | {}", line.trim());
+            }
+        }
+    }
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -1078,7 +1141,7 @@ where
         let body = collect_and_rewrite_request_body(
             req,
             client,
-            &rewrite_result.rewritten,
+            &final_header,
             header_str,
             &req.raw_header[header_end..],
             options.resolver,
@@ -1091,11 +1154,15 @@ where
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else if options.deny_uninspected_credentials {
+        // Fork: forward `final_header` (post-cred_inject), not the
+        // pre-cred_inject `rewrite_result.rewritten`. Only the SigV4 branch
+        // above may sign/forward pre-cred_inject bytes (see the INVARIANT
+        // comment at `final_header`).
         if let Err(error) = relay_request_body_with_marker_guard(
             req,
             client,
             upstream,
-            &rewrite_result.rewritten,
+            &final_header,
             &req.raw_header[header_end..],
             options.generation_guard,
         )
@@ -1108,10 +1175,7 @@ where
         }
     } else {
         ensure_credential_generation_current(options)?;
-        upstream
-            .write_all(&rewrite_result.rewritten)
-            .await
-            .into_diagnostic()?;
+        upstream.write_all(&final_header).await.into_diagnostic()?;
 
         let overflow = &req.raw_header[header_end..];
         if !overflow.is_empty() {
@@ -3172,6 +3236,30 @@ where
         "relay_response framing"
     );
 
+    // Egress observability (DEBUG-gated, OFF by default): surface the
+    // subscription billing-bucket response headers for testing — `overage-status`,
+    // `unified-5h-status`, `unified-7d-status`, `representative-claim`, and the
+    // `anthropic-ratelimit-*` family. These are non-secret routing/quota signals.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for line in header_str.lines().skip(1) {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("overage-status:")
+                || lower.starts_with("unified-5h-status:")
+                || lower.starts_with("unified-7d-status:")
+                || lower.starts_with("representative-claim:")
+                || lower.starts_with("anthropic-ratelimit-")
+            {
+                // Embed status + value in the message (not structured fields) so
+                // they render in the shorthand log that `openlock logs` surfaces.
+                debug!(
+                    "l7 egress response header [{}] | {}",
+                    status_code,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     // 101 Switching Protocols: the connection has been upgraded (e.g. to
     // WebSocket).  Forward the 101 headers to the client and signal the
     // caller to switch to raw bidirectional TCP relay.  Any bytes read
@@ -3610,6 +3698,92 @@ fn is_benign_close(err: &std::io::Error) -> bool {
     )
 }
 
+pub(crate) async fn echo_http_request<C>(
+    req: &L7Request,
+    client: &mut C,
+    resolver: Option<&SecretResolver>,
+    cred_inject: Option<&crate::l7::CredInjectConfig>,
+    policy_name: &str,
+) -> Result<RelayOutcome>
+where
+    C: AsyncWrite + Unpin,
+{
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |p| p + 4);
+
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("echo: credential rewrite failed: {e}"))?;
+
+    let cred_inject_applied =
+        cred_inject.is_some_and(|ci| !ci.strip_headers.is_empty() || !ci.inject.is_empty());
+
+    let final_header =
+        apply_cred_inject_or_default(rewrite_result.rewritten, cred_inject, resolver, "echo: ")?;
+
+    let header_str = String::from_utf8_lossy(&final_header);
+    let mut lines = header_str.split("\r\n");
+
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let full_target = parts.next().unwrap_or("").to_string();
+
+    let (path, query) = match full_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(format!("?{q}"))),
+        None => (full_target, None),
+    };
+
+    let mut headers = serde_json::Map::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(
+                name.trim().to_string(),
+                serde_json::Value::String(value.trim().to_string()),
+            );
+        }
+    }
+
+    let body_length: serde_json::Value = match req.body_length {
+        BodyLength::ContentLength(n) => serde_json::Value::Number(n.into()),
+        BodyLength::Chunked => serde_json::Value::String("chunked".to_string()),
+        BodyLength::None => serde_json::Value::Null,
+    };
+
+    let json = serde_json::json!({
+        "echo": true,
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": serde_json::Value::Object(headers),
+        "body_length": body_length,
+        "policy": policy_name,
+        "cred_inject_applied": cred_inject_applied,
+    });
+
+    let body = serde_json::to_string_pretty(&json)
+        .map_err(|e| miette!("echo: JSON serialization failed: {e}"))?;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    Ok(RelayOutcome::Reusable)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::iter_on_single_items,
@@ -3621,9 +3795,9 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::opa::OpaEngine;
+    use SecretResolver;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use openshell_core::proposals::AgentProposals;
-    use openshell_core::secrets::SecretResolver;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -6058,6 +6232,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
             ),
         )
         .await
@@ -6114,6 +6289,7 @@ mod tests {
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
+                None,
                 None,
             ),
         )
@@ -6704,6 +6880,7 @@ mod tests {
             &mut proxy_to_upstream,
             None,
             Some(&guard),
+            None,
         )
         .await;
         assert!(
@@ -6933,6 +7110,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
             ),
         )
         .await
@@ -6996,6 +7174,7 @@ mod tests {
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
+                None, // <-- No resolver, as in the L4 raw tunnel path
                 None,
             ),
         )
@@ -7092,6 +7271,7 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver,
+                None,
             ),
         )
         .await
@@ -7293,6 +7473,104 @@ mod tests {
         let mut forwarded = Vec::new();
         upstream_side.read_to_end(&mut forwarded).await.unwrap();
         assert!(!contains_reserved_credential_marker_bytes(&forwarded));
+    }
+
+    #[tokio::test]
+    async fn deny_uninspected_branch_still_applies_cred_inject() {
+        // Fork: with `deny_uninspected_credentials: true` (the branch a
+        // cred_inject endpoint takes whenever a resolver is present and
+        // allow_uninspected_credentials is false) the bytes forwarded upstream
+        // must be the post-cred_inject `final_header`: injected header present
+        // with the real secret, stripped caller header gone. The upstream task
+        // answers with a 200 because the relay awaits the response.
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-real-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = b"{\"hello\":true}";
+        let mut raw_header = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nauthorization: Bearer caller-supplied\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(body);
+        let expected_total = raw_header.len();
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let cred_inject = crate::l7::CredInjectConfig {
+            strip_headers: vec!["authorization".to_string()],
+            inject: vec![openshell_core::secrets::CredInjectDirective {
+                header: "x-api-key".to_string(),
+                from_credential: "ANTHROPIC_API_KEY".to_string(),
+                value_prefix: String::new(),
+            }],
+        };
+        // Keep the client side alive so the relayed response has somewhere to go.
+        let (_client_side, mut proxy_client) = tokio::io::duplex(4096);
+        let (mut proxy_upstream, mut upstream_side) = tokio::io::duplex(4096);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            // The forwarded request is at most a few bytes shorter than the
+            // original (one header stripped, one injected); read until the
+            // body has fully arrived.
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                let text = String::from_utf8_lossy(&buf[..total]);
+                if text.ends_with("{\"hello\":true}") {
+                    break;
+                }
+                assert!(total < expected_total + 64, "forwarded request too long");
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_client,
+            &mut proxy_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                deny_uninspected_credentials: true,
+                cred_inject: Some(&cred_inject),
+                host: "api.anthropic.com",
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("relay should succeed");
+
+        let forwarded = upstream_task.await.expect("upstream task");
+        assert!(
+            forwarded.contains("x-api-key: sk-ant-real-key"),
+            "injected header must reach upstream: {forwarded}"
+        );
+        assert!(
+            !forwarded.to_ascii_lowercase().contains("authorization:"),
+            "stripped caller header must not reach upstream: {forwarded}"
+        );
+        assert!(!forwarded.contains("caller-supplied"), "{forwarded}");
     }
 
     #[tokio::test]
@@ -7948,5 +8226,115 @@ mod tests {
             detect_payload_mode(headers).unwrap(),
             SigV4PayloadMode::UnsignedPayload
         );
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_returns_json_with_rewritten_headers() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-real-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.unwrap();
+
+        let placeholder = child_env.get("ANTHROPIC_API_KEY").unwrap();
+
+        let raw_header = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: {placeholder}\r\nContent-Type: application/json\r\n\r\n"
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: BodyLength::ContentLength(42),
+        };
+
+        let cred_inject = crate::l7::CredInjectConfig {
+            strip_headers: vec!["x-api-key".to_string()],
+            inject: vec![openshell_core::secrets::CredInjectDirective {
+                header: "x-api-key".to_string(),
+                from_credential: "ANTHROPIC_API_KEY".to_string(),
+                value_prefix: String::new(),
+            }],
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(
+            &req,
+            &mut client_write,
+            Some(&resolver),
+            Some(&cred_inject),
+            "test_policy",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["path"], "/v1/messages");
+        assert_eq!(json["headers"]["x-api-key"], "sk-ant-real-key");
+        assert!(json["headers"].get("Host").is_some() || json["headers"].get("host").is_some());
+        assert_eq!(json["body_length"], 42);
+        assert_eq!(json["policy"], "test_policy");
+        assert_eq!(json["cred_inject_applied"], true);
+    }
+
+    #[tokio::test]
+    async fn echo_http_request_without_cred_inject() {
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/models".to_string(),
+            query_params: {
+                let mut m = HashMap::new();
+                m.insert("limit".to_string(), vec!["10".to_string()]);
+                m
+            },
+            raw_header: b"GET /v1/models?limit=10 HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer token\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let (mut client_write, mut client_reader) = tokio::io::duplex(4096);
+
+        let outcome = echo_http_request(&req, &mut client_write, None, None, "my_policy")
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+
+        drop(client_write);
+        let mut response_buf = vec![0u8; 4096];
+        let n = AsyncReadExt::read(&mut client_reader, &mut response_buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response_buf[..n]);
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let json: serde_json::Value = serde_json::from_str(&response[body_start..]).unwrap();
+
+        assert_eq!(json["echo"], true);
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["path"], "/v1/models");
+        assert_eq!(json["query"], "?limit=10");
+        assert_eq!(json["headers"]["Authorization"], "Bearer token");
+        assert_eq!(json["cred_inject_applied"], false);
+        assert!(json["body_length"].is_null() || json["body_length"] == 0);
     }
 }
