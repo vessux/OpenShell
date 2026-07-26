@@ -68,6 +68,35 @@ Use this only for driver-specific fields that do not have a stable CLI flag.
 Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
 the same behavior.
 
+### Bind Volumes
+
+Mount a host directory into the sandbox with `--volume`:
+
+```shell
+openshell sandbox create --volume /path/on/host:/path/in/sandbox -- claude
+openshell sandbox create --volume /path/on/host:/path/in/sandbox:ro -- claude
+```
+
+The host path must be absolute and exist before the sandbox starts. The optional
+`:ro` suffix mounts the directory read-only inside the sandbox.
+
+`--volume` is CLI sugar over `template.driver_config`: each flag becomes a bind
+mount entry under the active compute driver's block, equivalent to passing
+`--driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"...","target":"...","read_only":false}]}}'`
+directly. The gateway must have `enable_bind_mounts = true` set under
+`[openshell.drivers.podman]` or `[openshell.drivers.docker]` (see
+[gateway configuration](/reference/gateway-config)), or sandbox creation fails
+with `bind mounts require enable_bind_mounts = true`.
+
+On rootless Podman, OpenShell automatically configures user-namespace remapping
+so that files in the bind mount are readable and writable by the sandbox process
+without manual `chown`. Docker rootless requires daemon-wide `userns-remap`
+configuration; without it, bind-mount file ownership may not align with the
+sandbox user.
+
+Not supported on the VM driver — sandbox creation fails with
+`bind mounts not supported on vm driver`.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:

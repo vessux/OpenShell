@@ -99,6 +99,12 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Field 9003 was `volumes` (mirrored openshell.v1.SandboxSpec.volumes,
+  // fork-added `BindVolume` passthrough). Removed: bind mounts now flow
+  // through the upstream `DriverSandboxTemplate.driver_config` envelope.
+  // Reserved rather than reused per fork field-number policy.
+  reserved 9003;
+  reserved "volumes";
 }
 
 message ResourceRequirements {

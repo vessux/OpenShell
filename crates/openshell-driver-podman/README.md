@@ -406,6 +406,41 @@ matter compared to cluster or rootful runtimes:
 8. tmpfs at `/run/netns`: a private tmpfs lets the supervisor create named
    network namespaces via `ip netns add`.
 
+## Bind Volumes (`--volume`)
+
+`openshell sandbox create --volume <HOST>:<CONTAINER>[:ro]` is CLI sugar:
+`openshell-cli` translates each flag into a `{"type": "bind", "source",
+"target", "read_only"}` entry under `template.driver_config.podman.mounts` —
+the same shape `--driver-config-json` accepts directly, and `read_only` is
+always emitted explicitly (upstream's `PodmanDriverMountConfig::Bind` defaults
+`read_only` to `true` when the field is absent, the opposite of `--volume`'s
+own no-`:ro` default). The host path must be absolute and exist; the
+container path must be absolute. The optional `:ro` suffix makes the bind
+read-only. `enable_bind_mounts = true` must be set under
+`[openshell.drivers.podman]`, same as any other driver-config bind mount.
+
+The mount itself is emitted by `podman_user_mounts` (see "Driver Config
+Mounts" above) — there is no separate `--volume`-specific mount-building path
+in this crate.
+
+On rootless podman, whenever the resolved driver-config carries at least one
+bind-type mount — however it arrived, `--volume` or a raw `--driver-config-json`
+bind entry — the driver:
+
+1. Inspects the sandbox image's `Config.User` directive via libpod
+   `/images/{name}/json`. The directive is parsed as `uid` or
+   `uid:gid`; empty or non-numeric values fall back to the
+   community-image default of `(1000660000, 1000660000)`.
+2. Sets the libpod `userns` field to
+   `{ nsmode: "keep-id", value: "uid=N,gid=N" }`. This maps the
+   container sandbox uid bidirectionally to the host caller's uid,
+   so bind files are mutually readable + writable across the
+   boundary.
+
+When no bind-type mount is present the driver leaves `userns` unset
+(libpod default mapping), preserving prior behaviour for copy-only
+sandboxes.
+
 ## Implementation References
 
 - Gateway integration: `crates/openshell-server/src/compute/mod.rs`
