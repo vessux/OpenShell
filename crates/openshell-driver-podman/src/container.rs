@@ -647,6 +647,21 @@ fn podman_user_mounts(
     Ok(result)
 }
 
+/// Returns true if the sandbox's resolved podman driver-config carries at
+/// least one bind-type mount. Used by the driver to decide whether the
+/// `PodmanClient::image_user` image-inspect round-trip is worth performing
+/// before building the container spec (the round-trip is only needed to pick
+/// the userns-remap uid/gid).
+///
+/// Malformed driver-config is reported as `false` here rather than
+/// propagated: the authoritative validation error still surfaces from
+/// `podman_user_mounts` when the container spec is built, this is purely an
+/// early-exit optimization.
+pub fn podman_config_has_bind_mount(sandbox: &DriverSandbox, enable_bind_mounts: bool) -> bool {
+    podman_user_mounts(sandbox, enable_bind_mounts)
+        .is_ok_and(|mounts| mounts.mounts.iter().any(|m| m.kind == "bind"))
+}
+
 fn podman_driver_config(
     template: &DriverSandboxTemplate,
     enable_bind_mounts: bool,
@@ -829,6 +844,12 @@ pub fn build_container_spec_with_token_and_gpu_default(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
+    // Captured before `user_mounts.mounts` is moved into the container spec's
+    // mount list below — this is the re-keyed userns-remap trigger: it used to
+    // fire on the fork's own (now-removed) `spec.volumes`, and now fires on
+    // any bind-type mount in the resolved driver-config, however it arrived
+    // (the `--volume` CLI sugar or a raw `--driver-config-json` bind mount).
+    let has_bind_mount = user_mounts.mounts.iter().any(|m| m.kind == "bind");
     let devices = build_devices(sandbox, selected_default_device)?;
 
     // Network configuration -- always bridge mode.
@@ -1049,28 +1070,20 @@ pub fn build_container_spec_with_token_and_gpu_default(
         userns: None,
     };
 
-    // Bind mounts requested via the CLI's --volume flag.
-    if let Some(spec) = sandbox.spec.as_ref() {
-        for v in &spec.volumes {
-            let mut options = vec!["rbind".to_string()];
-            if v.read_only {
-                options.push("ro".into());
-            }
-            container_spec.mounts.push(Mount {
-                kind: "bind".into(),
-                source: v.host_path.clone(),
-                destination: v.container_path.clone(),
-                options,
-            });
-        }
-        if !spec.volumes.is_empty() {
-            let (uid, gid) =
-                image_sandbox_user.unwrap_or((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
-            container_spec.userns = Some(UserNamespace {
-                nsmode: "keep-id".into(),
-                value: format!("uid={uid},gid={gid}"),
-            });
-        }
+    // Auto userns-remap on rootless podman: when the resolved driver-config
+    // carries at least one bind-type mount (already folded into
+    // `container_spec.mounts` above via `user_mounts`), set
+    // `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>` so
+    // bind-mount file ownership maps bidirectionally between host and
+    // container. `image_sandbox_user` is resolved by the caller (driver.rs)
+    // from the image's `Config.User` directive.
+    if has_bind_mount {
+        let (uid, gid) =
+            image_sandbox_user.unwrap_or((COMMUNITY_SANDBOX_UID, COMMUNITY_SANDBOX_UID));
+        container_spec.userns = Some(UserNamespace {
+            nsmode: "keep-id".into(),
+            value: format!("uid={uid},gid={gid}"),
+        });
     }
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
@@ -2247,80 +2260,26 @@ mod tests {
     }
 
     #[test]
-    fn build_container_spec_emits_bind_mount_entries() {
-        let mut sandbox = test_sandbox("id-1", "name-1");
-        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
-            volumes: vec![
-                openshell_core::proto::compute::v1::BindVolume {
-                    host_path: "/host/a".into(),
-                    container_path: "/container/a".into(),
-                    read_only: false,
-                },
-                openshell_core::proto::compute::v1::BindVolume {
-                    host_path: "/host/b".into(),
-                    container_path: "/container/b".into(),
-                    read_only: true,
-                },
-            ],
-            ..Default::default()
-        });
-        let cfg = test_config();
-        let spec_value = build_container_spec(&sandbox, &cfg, None);
-        let mounts = spec_value
-            .get("mounts")
-            .and_then(|v| v.as_array())
-            .expect("mounts array");
-        let bind_mounts: Vec<_> = mounts
-            .iter()
-            .filter(|m| m.get("type").and_then(|t| t.as_str()) == Some("bind"))
-            .collect();
-        assert_eq!(bind_mounts.len(), 2, "expected exactly 2 bind mounts");
-        assert_eq!(
-            bind_mounts[0]
-                .get("source")
-                .and_then(|v| v.as_str())
-                .unwrap(),
-            "/host/a"
-        );
-        assert_eq!(
-            bind_mounts[0]
-                .get("destination")
-                .and_then(|v| v.as_str())
-                .unwrap(),
-            "/container/a"
-        );
-        let opts0: Vec<&str> = bind_mounts[0]
-            .get("options")
-            .and_then(|v| v.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|o| o.as_str())
-            .collect();
-        assert!(opts0.contains(&"rbind"));
-        assert!(!opts0.contains(&"ro")); // first mount is read-write
-        let opts: Vec<&str> = bind_mounts[1]
-            .get("options")
-            .and_then(|v| v.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|o| o.as_str())
-            .collect();
-        assert!(opts.contains(&"rbind"));
-        assert!(opts.contains(&"ro"));
-    }
+    fn build_container_spec_sets_userns_keep_id_when_bind_mount_present() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
-    #[test]
-    fn build_container_spec_sets_userns_keep_id_when_volumes_present() {
         let mut sandbox = test_sandbox("id-1", "name-1");
-        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
-            volumes: vec![openshell_core::proto::compute::v1::BindVolume {
-                host_path: "/host".into(),
-                container_path: "/container".into(),
-                read_only: false,
-            }],
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host",
+                        "target": "/sandbox/container",
+                        "read_only": false
+                    }]
+                }))),
+                ..Default::default()
+            }),
             ..Default::default()
         });
-        let cfg = test_config();
+        let mut cfg = test_config();
+        cfg.enable_bind_mounts = true;
         let spec_value = build_container_spec(&sandbox, &cfg, Some((1_000_660_000, 1_000_660_000)));
         let userns = spec_value.get("userns").expect("userns set");
         assert_eq!(
@@ -2334,8 +2293,34 @@ mod tests {
     }
 
     #[test]
-    fn build_container_spec_omits_userns_when_no_volumes() {
+    fn build_container_spec_omits_userns_when_no_bind_mount() {
         let sandbox = test_sandbox("id-1", "name-1");
+        let cfg = test_config();
+        let spec_value = build_container_spec(&sandbox, &cfg, None);
+        assert!(spec_value.get("userns").is_none() || spec_value.get("userns").unwrap().is_null());
+    }
+
+    #[test]
+    fn build_container_spec_omits_userns_for_non_bind_mounts() {
+        // A driver-config mount that ISN'T bind-type (e.g. a named volume)
+        // must not trigger the userns-remap — only host-path bind mounts
+        // need the uid/gid ownership fixup.
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("id-1", "name-1");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let cfg = test_config();
         let spec_value = build_container_spec(&sandbox, &cfg, None);
         assert!(spec_value.get("userns").is_none() || spec_value.get("userns").unwrap().is_null());

@@ -94,19 +94,12 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
-  // Bind-mount entries: live host-path passthrough into the sandbox.
-  // Fork-added field; uses the 9000+ range reserved for openlock additions
-  // (mirrors openshell.v1.SandboxSpec.volumes) to stay clear of upstream's
-  // sequential numbering — upstream's sandbox_token took the old field 11.
-  repeated BindVolume volumes = 9003;
-}
-
-// A bind-mounted volume from the host into the sandbox.
-// Mirrors openshell.v1.BindVolume; server maps between them.
-message BindVolume {
-  string host_path = 1;
-  string container_path = 2;
-  bool read_only = 3;
+  // Field 9003 was `volumes` (mirrored openshell.v1.SandboxSpec.volumes,
+  // fork-added `BindVolume` passthrough). Removed: bind mounts now flow
+  // through the upstream `DriverSandboxTemplate.driver_config` envelope.
+  // Reserved rather than reused per fork field-number policy.
+  reserved 9003;
+  reserved "volumes";
 }
 
 // Driver-owned runtime template consumed by the compute platform.

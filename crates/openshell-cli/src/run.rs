@@ -36,7 +36,7 @@ use openshell_core::progress::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    BindVolume, ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
+    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
     DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
@@ -1665,6 +1665,82 @@ fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value
     Ok(Value { kind: Some(kind) })
 }
 
+/// Fold `--volume HOST:CONTAINER[:ro]` specs into the driver-config envelope
+/// as upstream driver-config bind mounts.
+///
+/// `--volume` is thin CLI sugar over `--driver-config-json`: each parsed spec
+/// becomes a `{"type": "bind", "source", "target", "read_only"}` mount entry,
+/// appended under the `podman`, `docker`, AND `vm` blocks (the CLI doesn't
+/// know which compute driver is active — that's a gateway-side configuration
+/// — so all three are populated and the gateway's `select_driver_config`
+/// forwards only the block matching the active driver; the others are
+/// silently discarded). `read_only` is always emitted explicitly: upstream's
+/// `PodmanDriverMountConfig::Bind` defaults `read_only` to `true` when the
+/// field is absent, the opposite of this flag's own default, so omitting it
+/// would silently turn every plain `--volume` (no `:ro`) read-only.
+///
+/// The `vm` block is populated too, even though the vm driver has no mount
+/// support at all: `VmSandboxDriverConfig` explicitly rejects a non-empty
+/// `mounts` list with a clear "not supported on vm driver" error, so a
+/// `--volume` against a vm-driver sandbox fails loudly instead of being
+/// silently dropped by `select_driver_config` the way an unrecognized `vm`
+/// key would be.
+///
+/// If `--driver-config-json` already populated a `podman`/`docker`/`vm`
+/// block with its own `mounts` array, the `--volume`-derived entries are
+/// appended to it rather than replacing it. If that existing block isn't a
+/// JSON object, or its `mounts` key isn't an array, the block is left
+/// untouched for that driver — the driver's own JSON validation reports the
+/// shape error rather than this merge step guessing at intent.
+fn add_volume_mounts_to_driver_config(
+    driver_config: Option<prost_types::Struct>,
+    volumes: &[BindVolumeSpec],
+) -> Result<Option<prost_types::Struct>> {
+    if volumes.is_empty() {
+        return Ok(driver_config);
+    }
+
+    let mount_entries: Vec<serde_json::Value> = volumes
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "type": "bind",
+                "source": v.host,
+                "target": v.container,
+                "read_only": v.read_only,
+            })
+        })
+        .collect();
+
+    let mut root: serde_json::Map<String, serde_json::Value> = driver_config
+        .as_ref()
+        .map(openshell_core::proto_struct::struct_to_json_object)
+        .unwrap_or_default();
+
+    for driver_name in ["podman", "docker", "vm"] {
+        let driver_block = root
+            .entry(driver_name.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(driver_obj) = driver_block.as_object_mut() else {
+            continue;
+        };
+        let mounts = driver_obj
+            .entry("mounts")
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(mounts_arr) = mounts.as_array_mut() else {
+            continue;
+        };
+        mounts_arr.extend(mount_entries.clone());
+    }
+
+    Ok(Some(prost_types::Struct {
+        fields: root
+            .into_iter()
+            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
+            .collect::<Result<_>>()?,
+    }))
+}
+
 fn validate_cpu_quantity(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1834,6 +1910,7 @@ pub async fn sandbox_create(
     let driver_config = driver_config_json
         .map(parse_driver_config_json)
         .transpose()?;
+    let driver_config = add_volume_mounts_to_driver_config(driver_config, volumes)?;
 
     let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
         Some(SandboxTemplate {
@@ -1846,15 +1923,6 @@ pub async fn sandbox_create(
         None
     };
 
-    let proto_volumes: Vec<BindVolume> = volumes
-        .iter()
-        .map(|v| BindVolume {
-            host_path: v.host.clone(),
-            container_path: v.container.clone(),
-            read_only: v.read_only,
-        })
-        .collect();
-
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
@@ -1862,7 +1930,6 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
-            volumes: proto_volumes,
             log_level: log_level.unwrap_or_default().to_string(),
         }),
         name: name.unwrap_or_default().to_string(),
@@ -7742,11 +7809,12 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
-        format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
-        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
+        ProvisioningStep, TlsOptions, add_volume_mounts_to_driver_config,
+        build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items,
+        format_provider_attachment_table, gateway_add, gateway_auth_label,
+        gateway_env_override_warning, gateway_select_with, gateway_to_json, gateway_type_label,
+        git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
@@ -7756,6 +7824,7 @@ mod tests {
         service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
+    use crate::volume_spec::BindVolumeSpec;
     use hyper::StatusCode;
     use std::fs;
     use std::io::{Read, Write};
@@ -8233,6 +8302,128 @@ mod tests {
             err.to_string().contains("must be valid JSON"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Navigate to `driver_config.fields[driver_name].mounts` as a JSON array,
+    /// for asserting on the mount entries `--volume` produces.
+    fn driver_mounts_array(
+        config: &prost_types::Struct,
+        driver_name: &str,
+    ) -> Vec<serde_json::Value> {
+        let driver_value = config
+            .fields
+            .get(driver_name)
+            .unwrap_or_else(|| panic!("expected a '{driver_name}' block"));
+        let json = openshell_core::proto_struct::value_to_json(driver_value);
+        json.get("mounts")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("expected '{driver_name}.mounts' to be an array"))
+            .clone()
+    }
+
+    #[test]
+    fn add_volume_mounts_emits_explicit_read_only_false_for_plain_volume() {
+        // The read_only default-flip trap: upstream's PodmanDriverMountConfig::Bind
+        // defaults read_only to true when the field is ABSENT. A plain `--volume`
+        // (no `:ro`) must therefore emit `"read_only": false` explicitly, never
+        // omit the key, or every read-write mount would silently become read-only.
+        let volumes = [BindVolumeSpec {
+            host: "/host/rw".to_string(),
+            container: "/sandbox/rw".to_string(),
+            read_only: false,
+        }];
+        let config = add_volume_mounts_to_driver_config(None, &volumes)
+            .expect("merge should succeed")
+            .expect("driver_config should be Some when volumes are present");
+
+        for driver_name in ["podman", "docker", "vm"] {
+            let mounts = driver_mounts_array(&config, driver_name);
+            assert_eq!(mounts.len(), 1, "{driver_name} should have one mount");
+            assert_eq!(mounts[0]["type"], "bind");
+            assert_eq!(mounts[0]["source"], "/host/rw");
+            assert_eq!(mounts[0]["target"], "/sandbox/rw");
+            assert_eq!(
+                mounts[0]["read_only"], false,
+                "{driver_name}: read_only must be explicit false, not omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn add_volume_mounts_emits_explicit_read_only_true_for_ro_volume() {
+        let volumes = [BindVolumeSpec {
+            host: "/host/ro".to_string(),
+            container: "/sandbox/ro".to_string(),
+            read_only: true,
+        }];
+        let config = add_volume_mounts_to_driver_config(None, &volumes)
+            .expect("merge should succeed")
+            .expect("driver_config should be Some when volumes are present");
+
+        for driver_name in ["podman", "docker", "vm"] {
+            let mounts = driver_mounts_array(&config, driver_name);
+            assert_eq!(mounts[0]["read_only"], true);
+        }
+    }
+
+    #[test]
+    fn add_volume_mounts_returns_none_when_no_volumes_and_no_driver_config() {
+        let config = add_volume_mounts_to_driver_config(None, &[]).expect("merge should succeed");
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn add_volume_mounts_appends_to_existing_driver_config_json_mounts() {
+        // A user combining --driver-config-json (with its own podman mounts)
+        // and --volume should get both sets of mounts, not one clobbering
+        // the other.
+        let existing = parse_driver_config_json(
+            r#"{"podman":{"mounts":[{"type":"tmpfs","target":"/sandbox/cache"}]}}"#,
+        )
+        .expect("driver-config-json should parse");
+
+        let volumes = [BindVolumeSpec {
+            host: "/host/data".to_string(),
+            container: "/sandbox/data".to_string(),
+            read_only: false,
+        }];
+        let config = add_volume_mounts_to_driver_config(Some(existing), &volumes)
+            .expect("merge should succeed")
+            .expect("driver_config should be Some");
+
+        let mounts = driver_mounts_array(&config, "podman");
+        assert_eq!(
+            mounts.len(),
+            2,
+            "existing tmpfs mount plus the new bind mount"
+        );
+        assert!(mounts.iter().any(|m| m["type"] == "tmpfs"));
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m["type"] == "bind" && m["source"] == "/host/data")
+        );
+    }
+
+    #[test]
+    fn add_volume_mounts_populates_vm_block_so_vm_driver_rejects_loudly() {
+        // The CLI cannot know which compute driver is active (that's a
+        // gateway-side setting), so --volume must populate the `vm` block
+        // too: VmSandboxDriverConfig explicitly rejects a non-empty `mounts`
+        // list, turning what would otherwise be a silent no-op (an
+        // unrecognized `vm` key that `select_driver_config` just drops) into
+        // a clear "not supported on vm driver" error at sandbox-create time.
+        let volumes = [BindVolumeSpec {
+            host: "/host/data".to_string(),
+            container: "/sandbox/data".to_string(),
+            read_only: false,
+        }];
+        let config = add_volume_mounts_to_driver_config(None, &volumes)
+            .expect("merge should succeed")
+            .expect("driver_config should be Some when volumes are present");
+
+        let mounts = driver_mounts_array(&config, "vm");
+        assert_eq!(mounts.len(), 1, "vm block should carry the bind mount too");
     }
 
     #[test]

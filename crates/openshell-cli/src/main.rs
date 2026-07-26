@@ -1304,12 +1304,18 @@ enum SandboxCommands {
         /// Host path must be absolute and exist. Container path must be
         /// absolute. The optional `:ro` suffix makes the mount read-only.
         ///
+        /// Sugar over `--driver-config-json`: translates to a bind mount
+        /// entry under the active driver's block. Requires
+        /// `enable_bind_mounts = true` under `[openshell.drivers.podman]` or
+        /// `[openshell.drivers.docker]` on the gateway.
+        ///
         /// On rootless podman, the driver auto-applies
         /// `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>`
-        /// when any `--volume` is set, so bind file ownership maps
+        /// when any bind mount is present, so bind file ownership maps
         /// bidirectionally between host and container.
         ///
-        /// Not supported on the vm driver.
+        /// Not supported on the vm driver: sandbox creation fails with
+        /// "bind mounts not supported on vm driver".
         #[arg(long = "volume", help_heading = "MOUNT FLAGS")]
         volumes: Vec<String>,
 

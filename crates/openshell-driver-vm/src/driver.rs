@@ -87,6 +87,13 @@ struct VmSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     gpu_device_ids: Option<Vec<String>>,
+    /// Accepted only so a `--volume`-derived or hand-authored
+    /// `--driver-config-json` bind mount produces the clear
+    /// "not supported on vm driver" error below, instead of a bare
+    /// `deny_unknown_fields` "unknown field `mounts`" — the VM driver has no
+    /// mount-handling of any kind, so any non-empty value here is rejected.
+    #[serde(default)]
+    mounts: Vec<serde_json::Value>,
 }
 
 impl VmSandboxDriverConfig {
@@ -107,8 +114,15 @@ impl VmSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid vm driver_config: {err}"))
+        let parsed: Self = serde_json::from_value(struct_to_json_value(config))
+            .map_err(|err| format!("invalid vm driver_config: {err}"))?;
+        if !parsed.mounts.is_empty() {
+            return Err(
+                "bind mounts not supported on vm driver; remove --volume flags or use podman/docker driver"
+                    .to_string(),
+            );
+        }
+        Ok(parsed)
     }
 }
 
@@ -3113,11 +3127,6 @@ fn validate_vm_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), S
         ));
     }
 
-    if !spec.volumes.is_empty() {
-        return Err(Status::invalid_argument(
-            "bind mounts not supported on vm driver; remove --volume flags or use podman/docker driver",
-        ));
-    }
     Ok(())
 }
 
@@ -5367,23 +5376,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_rejects_bind_volumes() {
-        use openshell_core::proto::compute::v1::BindVolume;
-
+    fn validate_vm_sandbox_rejects_bind_mounts() {
+        // Replaces the coverage the deleted `spec.volumes`-based rejection
+        // gave: a bind-type mount reaching the vm driver via
+        // `template.driver_config.vm.mounts` (however it got there --
+        // `--volume` CLI sugar or a raw `--driver-config-json`) must produce
+        // the same clear error the old check gave, not a bare
+        // `deny_unknown_fields` "unknown field `mounts`".
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                volumes: vec![BindVolume {
-                    host_path: "/host/data".into(),
-                    container_path: "/data".into(),
-                    read_only: false,
-                }],
+                template: Some(SandboxTemplate {
+                    driver_config: Some(list_string_driver_config("mounts", &["bind"])),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let err = validate_vm_sandbox(&sandbox, false)
-            .expect_err("volumes should be rejected by vm driver");
+        let err = validate_vm_sandbox(&sandbox, false).expect_err("bind mounts should be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("not supported on vm driver"));
     }
