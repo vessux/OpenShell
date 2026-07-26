@@ -45,6 +45,18 @@ service OpenShell {
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
+  // Stop a sandbox container without deleting it. Workspace volume,
+  // provider links, and the sandbox record survive; the container is
+  // stopped via the underlying compute driver. Phase drifts from the
+  // backend watch stream. Use StartSandbox to bring it back live.
+  rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
+
+  // Start a previously-stopped sandbox container. Idempotent: returns
+  // success when the container is already running. Fails with NotFound
+  // when the sandbox record exists but its backend resource has been
+  // pruned.
+  rpc StartSandbox(StartSandboxRequest) returns (StartSandboxResponse);
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
@@ -405,6 +417,12 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  // Compute backend is intentionally stopped (explicit Stop RPC). Distinct
+  // from Error so reattach paths and external clients can tell a user-
+  // requested halt from a crash. Cleared by the Start RPC.
+  // Fork-added value; uses the 9000+ range reserved for openlock additions
+  // so upstream can keep extending the enum sequentially without colliding.
+  SANDBOX_PHASE_STOPPED = 9004;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -516,6 +534,29 @@ message DetachSandboxProviderResponse {
 // Delete sandbox response.
 message DeleteSandboxResponse {
   bool deleted = 1;
+}
+
+// Stop sandbox request.
+message StopSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+// Stop sandbox response.
+message StopSandboxResponse {}
+
+// Start sandbox request.
+message StartSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+// Start sandbox response.
+message StartSandboxResponse {
+  // True when a backend resource was found and started (or already
+  // running). False when the sandbox record exists but its backend
+  // resource is missing.
+  bool started = 1;
 }
 
 // Create SSH session request.

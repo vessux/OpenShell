@@ -50,9 +50,9 @@ use openshell_core::proto::{
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
-    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    SettingScope, SettingValue, StartSandboxRequest, StopSandboxRequest, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -97,6 +97,7 @@ fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Ready) => "Ready",
         Ok(SandboxPhase::Error) => "Error",
         Ok(SandboxPhase::Deleting) => "Deleting",
+        Ok(SandboxPhase::Stopped) => "Stopped",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -3335,7 +3336,7 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Ready) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Stopped) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
@@ -3607,6 +3608,80 @@ pub async fn sandbox_delete(
         }
     }
 
+    Ok(())
+}
+
+/// Stop a sandbox by name without deleting it. Workspace volume and
+/// provider links survive; use `sandbox start` to bring it back live.
+pub async fn sandbox_stop(
+    server: &str,
+    names: &[String],
+    all: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let names_to_stop: Vec<String> = if all {
+        let response = client
+            .list_sandboxes(ListSandboxesRequest {
+                limit: 1000,
+                offset: 0,
+                label_selector: String::new(),
+            })
+            .await
+            .into_diagnostic()?;
+        let sandboxes = response.into_inner().sandboxes;
+        if sandboxes.is_empty() {
+            println!("No sandboxes to stop.");
+            return Ok(());
+        }
+        sandboxes
+            .into_iter()
+            .map(|s| s.object_name().to_string())
+            .collect()
+    } else {
+        names.to_vec()
+    };
+
+    for name in &names_to_stop {
+        if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+            for port in stopped {
+                eprintln!(
+                    "{} Stopped forward of port {port} for sandbox {name}",
+                    "✓".green().bold(),
+                );
+            }
+        }
+
+        client
+            .stop_sandbox(StopSandboxRequest { name: name.clone() })
+            .await
+            .into_diagnostic()?;
+        println!("{} Stopped sandbox {name}", "✓".green().bold());
+    }
+
+    Ok(())
+}
+
+/// Start a previously-stopped sandbox by name. Idempotent: succeeds when
+/// the sandbox is already running. Fails if the backend resource has
+/// been pruned (e.g. by manual container removal).
+pub async fn sandbox_start(server: &str, names: &[String], tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .start_sandbox(StartSandboxRequest { name: name.clone() })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().started {
+            println!("{} Started sandbox {name}", "✓".green().bold());
+        } else {
+            println!(
+                "{} Sandbox {name} record exists but backend resource is missing",
+                "!".yellow(),
+            );
+        }
+    }
     Ok(())
 }
 
