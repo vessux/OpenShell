@@ -18,13 +18,12 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
-    BindVolume as DriverBindVolume, CreateSandboxRequest, DeleteSandboxRequest, DriverCondition,
-    DriverPlatformEvent, DriverResourceRequirements, DriverSandbox, DriverSandboxSpec,
-    DriverSandboxStatus, DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
-    ListSandboxesRequest, StopSandboxRequest as DriverStopSandboxRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
+    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
+    StopSandboxRequest as DriverStopSandboxRequest, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -1620,15 +1619,6 @@ fn driver_sandbox_spec_from_public(
             .transpose()?,
         gpu: spec.gpu,
         sandbox_token: String::new(),
-        volumes: spec
-            .volumes
-            .iter()
-            .map(|v| DriverBindVolume {
-                host_path: v.host_path.clone(),
-                container_path: v.container_path.clone(),
-                read_only: v.read_only,
-            })
-            .collect(),
     })
 }
 

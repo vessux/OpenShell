@@ -339,18 +339,13 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
-  // Bind-mount entries: live host-path passthrough into the sandbox.
-  // Fork-added field; uses the 9000+ range reserved for openlock additions
-  // to stay clear of upstream's sequential numbering.
-  repeated BindVolume volumes = 9003;
-}
-
-// A bind-mounted volume from the host into the sandbox.
-// Equivalent to a `podman -v HOST:CONTAINER[:ro]` argument.
-message BindVolume {
-  string host_path = 1;
-  string container_path = 2;
-  bool read_only = 3;
+  // Field 9003 was `volumes` (fork-added `BindVolume` passthrough for the
+  // `--volume HOST:CONTAINER[:ro]` CLI flag). Removed: bind mounts now flow
+  // through the upstream `SandboxTemplate.driver_config` envelope (driver
+  // -config-json), which already supports typed bind/volume/tmpfs/image
+  // mounts. Reserved rather than reused per fork field-number policy.
+  reserved 9003;
+  reserved "volumes";
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

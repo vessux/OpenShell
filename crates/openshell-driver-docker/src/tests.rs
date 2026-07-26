@@ -43,7 +43,6 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             sandbox_token: String::new(),
-            volumes: vec![],
         }),
         status: None,
     }
@@ -983,28 +982,6 @@ fn build_environment_uses_token_file_without_raw_token_env() {
         "{}={SANDBOX_TOKEN_MOUNT_PATH}",
         openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
     )));
-}
-
-#[test]
-fn build_binds_emits_user_volume_entries() {
-    let mut sandbox = test_sandbox();
-    if let Some(spec) = sandbox.spec.as_mut() {
-        spec.volumes = vec![
-            openshell_core::proto::compute::v1::BindVolume {
-                host_path: "/host/a".into(),
-                container_path: "/container/a".into(),
-                read_only: false,
-            },
-            openshell_core::proto::compute::v1::BindVolume {
-                host_path: "/host/b".into(),
-                container_path: "/container/b".into(),
-                read_only: true,
-            },
-        ];
-    }
-    let binds = build_binds(&sandbox, &runtime_config()).unwrap();
-    assert!(binds.contains(&"/host/a:/container/a".to_string()));
-    assert!(binds.contains(&"/host/b:/container/b:ro".to_string()));
 }
 
 #[test]
