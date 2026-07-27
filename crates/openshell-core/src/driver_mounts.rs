@@ -25,6 +25,29 @@ pub enum SelinuxLabel {
     Private,
 }
 
+/// Returns `true` when `SELinux` is enabled (enforcing or permissive) on the
+/// host.
+///
+/// Checks whether selinuxfs is mounted, matching Podman's own detection
+/// logic. Bind-mount relabeling (the `z` mount option) is needed in both
+/// enforcing and permissive modes: enforcing blocks access outright, while
+/// permissive floods the audit log with AVC denials that mask real issues.
+///
+/// On non-`SELinux` systems (Ubuntu, macOS, Alpine) the directory does not
+/// exist and this returns `false`, leaving mount options unchanged.
+///
+/// Shared by the Podman and Docker drivers so both apply the same default
+/// relabelling behaviour for user bind mounts (see `SelinuxLabel`).
+#[cfg(target_os = "linux")]
+pub fn is_selinux_enabled() -> bool {
+    Path::new("/sys/fs/selinux").is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_selinux_enabled() -> bool {
+    false
+}
+
 const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/opt/openshell",
     "/etc/openshell",

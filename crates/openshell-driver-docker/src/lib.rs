@@ -261,7 +261,7 @@ impl DockerSandboxDriverConfig {
     }
 }
 
-use openshell_core::driver_mounts::SelinuxLabel;
+use openshell_core::driver_mounts::{SelinuxLabel, is_selinux_enabled};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -1791,6 +1791,12 @@ fn docker_bind_string(
     match selinux_label {
         Some(SelinuxLabel::Shared) => opts.push("z"),
         Some(SelinuxLabel::Private) => opts.push("Z"),
+        // On SELinux-enabled systems (Fedora, RHEL), a host bind mount
+        // carries the host's `user_home_t` (or similar) context, which
+        // `container_t` cannot access. Default to the shared relabel (`z`,
+        // not `Z`) since the host directory is genuinely shared with the
+        // user outside the container. Mirrors the Podman driver's default.
+        None if is_selinux_enabled() => opts.push("z"),
         None => {}
     }
 

@@ -6,7 +6,7 @@
 use crate::client::COMMUNITY_SANDBOX_UID;
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::driver_mounts::SelinuxLabel;
+use openshell_core::driver_mounts::{SelinuxLabel, is_selinux_enabled};
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
@@ -15,27 +15,6 @@ use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-#[cfg(target_os = "linux")]
-use std::path::Path;
-
-/// Returns `true` when `SELinux` is enabled (enforcing or permissive).
-///
-/// Checks whether selinuxfs is mounted, matching Podman's own detection
-/// logic. Bind-mount relabeling (the `z` mount option) is needed in both
-/// enforcing and permissive modes: enforcing blocks access outright, while
-/// permissive floods the audit log with AVC denials that mask real issues.
-///
-/// On non-`SELinux` systems (Ubuntu, macOS, Alpine) the directory does not
-/// exist and this returns `false`, leaving mount options unchanged.
-#[cfg(target_os = "linux")]
-fn is_selinux_enabled() -> bool {
-    Path::new("/sys/fs/selinux").is_dir()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_selinux_enabled() -> bool {
-    false
-}
 
 pub use openshell_core::driver_utils::{
     LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
@@ -635,6 +614,15 @@ fn podman_user_mounts(
                 match selinux_label {
                     Some(SelinuxLabel::Shared) => options.push("z".to_string()),
                     Some(SelinuxLabel::Private) => options.push("Z".to_string()),
+                    // On SELinux-enabled systems (Fedora, RHEL), a host bind
+                    // mount carries the host's `user_home_t` (or similar)
+                    // context, which `container_t` cannot access. Podman
+                    // relabels its own managed volumes automatically, but a
+                    // plain host bind gets no such treatment. Default to the
+                    // shared relabel (`z`, not `Z`) since the host directory
+                    // is genuinely shared with the user outside the
+                    // container.
+                    None if is_selinux_enabled() => options.push("z".to_string()),
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
@@ -2478,6 +2466,58 @@ mod tests {
                         && options.iter().any(|o| o.as_str() == Some("Z"))
                 })
         }));
+    }
+
+    #[test]
+    fn container_spec_bind_mount_selinux_default_label() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/data/unlabelled",
+                        "target": "/sandbox/data",
+                        "read_only": true
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config, None);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        let bind_mount = mounts
+            .iter()
+            .find(|mount| {
+                mount["type"].as_str() == Some("bind")
+                    && mount["source"].as_str() == Some("/data/unlabelled")
+                    && mount["destination"].as_str() == Some("/sandbox/data")
+            })
+            .expect("unlabelled bind mount should be present");
+
+        // A user bind mount with no explicit `selinux_label` should default
+        // to the shared relabel ('z') iff SELinux is enabled on the host,
+        // and carry no relabel option otherwise. This keeps the test
+        // meaningful on Fedora CI (SELinux enforcing) while staying green
+        // on this non-SELinux dev machine, mirroring the TLS-mount test
+        // above.
+        let has_z = bind_mount["options"]
+            .as_array()
+            .is_some_and(|options| options.iter().any(|o| o.as_str() == Some("z")));
+        assert_eq!(
+            has_z,
+            is_selinux_enabled(),
+            "unlabelled bind mount should include 'z' option iff SELinux is enabled"
+        );
     }
 
     #[test]

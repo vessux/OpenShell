@@ -972,10 +972,20 @@ fn bind_mount_without_selinux_label() {
         .binds
         .expect("binds should be set");
 
-    let expected = format!("{src_path}:/sandbox/host");
+    // On non-SELinux hosts (this test suite's usual CI/dev machines) no
+    // relabel option is added. On SELinux-enabled hosts (Fedora, RHEL) the
+    // driver now defaults an unlabelled bind mount to the shared relabel so
+    // the container can actually read the host path. Assert whichever is
+    // correct for the host actually running the test, so it stays green on
+    // both kinds of host without silently asserting nothing.
+    let expected = if is_selinux_enabled() {
+        format!("{src_path}:/sandbox/host:z")
+    } else {
+        format!("{src_path}:/sandbox/host")
+    };
     assert!(
         binds.iter().any(|b| b == &expected),
-        "expected no options suffix, got {binds:?}"
+        "expected {expected:?}, got {binds:?}"
     );
 }
 
