@@ -1727,6 +1727,88 @@ async fn cas_update_message_cas_rejects_name_change() {
     );
 }
 
+/// Regression test for `openlock-bb2`.
+///
+/// Migration 006 backfills the `objects.workspace` DB column to `'default'`
+/// for pre-existing rows, but has no way to touch the `workspace` field
+/// *inside* the stored protobuf payload (SQL can't decode/re-encode a
+/// protobuf blob). This seeds a row shaped exactly like a pre-migration row
+/// looks *after* migration 006 has run: DB column backfilled, payload
+/// untouched. Before the fix, `update_message_cas` reads this row via
+/// `decode_record`, which does not backfill workspace from the column, so
+/// `current.object_workspace()` is empty and the `requires_workspace()`
+/// guard hard-fails the write — exactly the failure mode that broke
+/// provider credential refresh after upgrade (every pre-existing `Provider`
+/// row became permanently unwritable).
+#[tokio::test]
+async fn cas_update_message_cas_repairs_legacy_row_with_unbackfilled_payload_workspace() {
+    use openshell_core::proto::Provider;
+
+    let store = test_store().await;
+
+    // Build a Provider payload as it would have been written *before* the
+    // workspace column existed: metadata.workspace is empty.
+    let legacy_provider = Provider {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "legacy-provider".to_string(),
+            name: "legacy-provider".to_string(),
+            created_at_ms: 1000,
+            labels: StdHashMap::new(),
+            annotations: StdHashMap::new(),
+            resource_version: 0,
+            workspace: String::new(), // never backfilled by migration 006
+            deletion_timestamp_ms: 0,
+        }),
+        r#type: "claude".to_string(),
+        credentials: StdHashMap::new(),
+        config: StdHashMap::new(),
+        credential_expires_at_ms: StdHashMap::new(),
+        profile_workspace: String::new(),
+    };
+
+    // Seed the row directly (bypassing put_message's workspace validation)
+    // with the DB column already backfilled to 'default' by migration 006,
+    // but the payload workspace left empty — the exact post-migration shape
+    // of every pre-existing row.
+    store
+        .put(
+            "provider",
+            "legacy-provider",
+            "legacy-provider",
+            "default",
+            &legacy_provider.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A rotated-credential write (the credential refresh worker's path)
+    // must round-trip successfully instead of hard-failing with
+    // "provider requires a non-empty workspace".
+    let updated = store
+        .update_message_cas::<Provider, _>("legacy-provider", 0, |current| {
+            current
+                .credentials
+                .insert("access_token".to_string(), "rotated-token".to_string());
+        })
+        .await
+        .expect(
+            "update must succeed for a legacy row whose DB column is backfilled \
+             but whose protobuf payload workspace is still empty",
+        );
+
+    assert_eq!(
+        updated.credentials.get("access_token"),
+        Some(&"rotated-token".to_string())
+    );
+    // The write must also repair the payload going forward: the workspace
+    // backfilled from the column is now persisted in the encoded message.
+    assert_eq!(
+        updated.metadata.as_ref().map(|m| m.workspace.as_str()),
+        Some("default")
+    );
+}
+
 #[tokio::test]
 async fn list_by_scope_returns_resource_version() {
     let store = test_store().await;

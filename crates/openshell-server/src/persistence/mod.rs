@@ -140,20 +140,30 @@ pub fn generate_name() -> String {
 /// Decode a single [`ObjectRecord`] into a protobuf message, hydrating
 /// `resource_version` from the authoritative DB row.
 ///
-/// Only `resource_version` is hydrated here; `workspace` is NOT backfilled from
-/// the DB column because the workspace field is authoritative in the protobuf
-/// payload at creation time. This is a breaking upgrade — pre-workspace records
-/// will carry an empty workspace until they are re-created.
+/// Also backfills `workspace` from the DB column when the decoded message's
+/// own workspace field is empty. Migration 006 backfilled the `workspace`
+/// *column* for pre-existing rows, but has no way to touch the workspace
+/// field inside the already-stored protobuf payload — a plain SQL migration
+/// cannot decode/re-encode a protobuf blob. Without this, `T::requires_workspace()`
+/// write-path guards (see `update_message_cas`, `put_scoped_message`) hard-fail on
+/// the very next write to any pre-existing row, since the workspace they see comes
+/// from the never-backfilled payload field. Backfilling here — the single point all
+/// reads funnel through — also self-heals the payload the next time the record is
+/// written, since callers typically clone the decoded message before mutating it.
+/// See `openlock-bb2`.
 ///
 /// Extracted to avoid repeating the identical decode-and-hydrate block across
 /// `get_message`, `get_message_by_name`, `list_messages`, and
 /// `list_messages_with_selector`.
-fn decode_record<T: Message + Default + SetResourceVersion>(
+fn decode_record<T: Message + Default + SetResourceVersion + ObjectWorkspace>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
     let mut message = T::decode(record.payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
     message.set_resource_version(record.resource_version);
+    if T::requires_workspace() && message.object_workspace().is_empty() {
+        message.set_object_workspace(&record.workspace);
+    }
     Ok(message)
 }
 
@@ -447,7 +457,9 @@ impl Store {
     }
 
     /// Fetch and decode a protobuf message by id.
-    pub async fn get_message<T: Message + Default + ObjectType + SetResourceVersion>(
+    pub async fn get_message<
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
+    >(
         &self,
         id: &str,
     ) -> PersistenceResult<Option<T>> {
@@ -458,7 +470,9 @@ impl Store {
     }
 
     /// Fetch and decode a protobuf message by workspace and name.
-    pub async fn get_message_by_name<T: Message + Default + ObjectType + SetResourceVersion>(
+    pub async fn get_message_by_name<
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
+    >(
         &self,
         workspace: &str,
         name: &str,
@@ -471,7 +485,9 @@ impl Store {
 
     /// List and decode protobuf messages by workspace, hydrating
     /// `resource_version` from the authoritative DB row (mirrors `get_message`).
-    pub async fn list_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+    pub async fn list_messages<
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
+    >(
         &self,
         workspace: &str,
         limit: u32,
@@ -486,7 +502,9 @@ impl Store {
 
     /// List and decode protobuf messages across all workspaces, hydrating
     /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+    pub async fn list_all_messages<
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
+    >(
         &self,
         limit: u32,
         offset: u32,
@@ -502,7 +520,7 @@ impl Store {
     /// selector filtering, hydrating `resource_version` from the authoritative
     /// DB row.
     pub async fn list_all_messages_with_selector<
-        T: Message + Default + ObjectType + SetResourceVersion,
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
     >(
         &self,
         label_selector: &str,
@@ -519,7 +537,7 @@ impl Store {
     /// List and decode protobuf messages with label selector filtering,
     /// hydrating `resource_version` from the authoritative DB row.
     pub async fn list_messages_with_selector<
-        T: Message + Default + ObjectType + SetResourceVersion,
+        T: Message + Default + ObjectType + SetResourceVersion + ObjectWorkspace,
     >(
         &self,
         workspace: &str,
