@@ -707,13 +707,20 @@ where
     let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    // NOTE: `rewrite_result.rewritten` is cloned rather than moved here because
-    // the SigV4 signing branch below (`options.credential_signing.is_sigv4()`)
-    // also needs it, pre-cred_inject, to compute the AWS signature. See the
-    // rebase note on that branch: cred_inject's strip-and-replace output
-    // (`final_header`) is currently NOT applied when SigV4 signing is active
-    // for this endpoint — that is a pre-existing gap surfaced by this merge,
-    // not something decided here.
+    // `rewrite_result.rewritten` is cloned rather than moved because the SigV4
+    // signing branch below (`options.credential_signing.is_sigv4()`) needs the
+    // pre-cred_inject bytes to compute the AWS signature, while cred_inject
+    // needs them to produce `final_header`.
+    //
+    // INVARIANT: an endpoint can never have both `credential_signing` and
+    // `cred_inject` set — `validate_sandbox_policy` rejects that combination at
+    // policy load (`PolicyViolation::CredentialSigningWithCredInject`). It must,
+    // because SigV4 signs the request as it stood *before* cred_inject ran, so
+    // allowing both would silently discard cred_inject's strip-and-replace and
+    // forward an agent-supplied credential header unstripped. SigV4 resolves its
+    // own AWS credentials through the same per-binary-scoped resolver, so it
+    // needs no help from cred_inject. If that validation is ever relaxed, this
+    // branch must be reworked to sign `final_header` instead.
     let final_header = apply_cred_inject_or_default(
         rewrite_result.rewritten.clone(),
         options.cred_inject,

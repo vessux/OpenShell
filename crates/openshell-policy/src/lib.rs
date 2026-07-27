@@ -1217,6 +1217,8 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// `credential_signing` and `cred_inject` are both set (fork addition).
+    CredentialSigningWithCredInject { policy_name: String, host: String },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
@@ -1305,6 +1307,17 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
                      and request_body_credential_rewrite set; these options are mutually exclusive"
+                )
+            }
+            Self::CredentialSigningWithCredInject { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
+                     and cred_inject set; these options are mutually exclusive. SigV4 signing \
+                     computes its signature over the pre-cred_inject request, so cred_inject's \
+                     strip-and-replace would be silently discarded on this endpoint. SigV4 \
+                     resolves its own AWS credentials through the same per-binary-scoped \
+                     resolver, so drop cred_inject here."
                 )
             }
             Self::InvalidMiddlewareConfig { name, reason } => {
@@ -1479,6 +1492,17 @@ pub fn validate_sandbox_policy(
             }
             if !ep.credential_signing.is_empty() && ep.request_body_credential_rewrite {
                 violations.push(PolicyViolation::CredentialSigningWithBodyRewrite {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            // Fork addition: SigV4 signs the request as it stood *before*
+            // cred_inject ran, so configuring both silently drops
+            // cred_inject's strip-and-replace on this endpoint -- the
+            // agent's own credential headers would survive unstripped.
+            // Reject at load rather than fail open at runtime.
+            if !ep.credential_signing.is_empty() && ep.cred_inject.is_some() {
+                violations.push(PolicyViolation::CredentialSigningWithCredInject {
                     policy_name: name.clone(),
                     host: ep.host.clone(),
                 });
@@ -2778,6 +2802,58 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::CredentialSigningWithBodyRewrite { .. }))
         );
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_with_cred_inject() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    cred_inject: Some(CredInjectConfig {
+                        provider: "anthropic".into(),
+                        strip_headers: vec!["authorization".into()],
+                        inject: vec![],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::CredentialSigningWithCredInject { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_allows_credential_signing_without_cred_inject() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        // SigV4 alone is the supported Bedrock shape: it resolves its own AWS
+        // credentials through the per-binary-scoped resolver.
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
