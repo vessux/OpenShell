@@ -5390,7 +5390,7 @@ mod tests {
                             path: "/usr/bin/curl".to_string(),
                             ..Default::default()
                         }],
-                    allowed_secrets: Vec::new(),
+                        allowed_secrets: Vec::new(),
                     }),
                     ..Default::default()
                 }],
@@ -6949,7 +6949,7 @@ mod tests {
                             path: "/usr/bin/curl".to_string(),
                             ..Default::default()
                         }],
-                    allowed_secrets: Vec::new(),
+                        allowed_secrets: Vec::new(),
                     }),
                     ..Default::default()
                 }],
@@ -7233,7 +7233,7 @@ mod tests {
                             path: "/usr/bin/curl".to_string(),
                             ..Default::default()
                         }],
-                    allowed_secrets: Vec::new(),
+                        allowed_secrets: Vec::new(),
                     }),
                     ..Default::default()
                 }],

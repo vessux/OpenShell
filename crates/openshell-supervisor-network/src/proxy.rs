@@ -5512,7 +5512,9 @@ network_policies: {}
             None,
             None,
             None,
-            Arc::new(crate::trust::TrustCache::new(std::time::Duration::from_secs(3600))),
+            Arc::new(crate::trust::TrustCache::new(
+                std::time::Duration::from_secs(3600),
+            )),
         ))
         .await
         .expect("malformed request should be handled");
@@ -9860,7 +9862,9 @@ network_policies:
                 None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
                 None,                      // activity_tx
-                Arc::new(crate::trust::TrustCache::new(std::time::Duration::from_secs(3600))), // trust_cache
+                Arc::new(crate::trust::TrustCache::new(
+                    std::time::Duration::from_secs(3600),
+                )), // trust_cache
             )),
         )
         .await

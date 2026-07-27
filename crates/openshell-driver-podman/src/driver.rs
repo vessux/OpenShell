@@ -1922,7 +1922,11 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        assert_eq!(requests.len(), 2, "no start request should be issued for already-running container");
+        assert_eq!(
+            requests.len(),
+            2,
+            "no start request should be issued for already-running container"
+        );
         assert!(requests[0].contains("/libpod/containers/json"));
         assert!(requests[1].contains(&format!("/libpod/containers/{container_id}/json")));
         let _ = fs::remove_file(socket_path);
