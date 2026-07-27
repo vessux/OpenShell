@@ -40,6 +40,14 @@ pub trait GetResourceVersion {
 pub trait ObjectWorkspace {
     fn object_workspace(&self) -> &str;
     fn requires_workspace() -> bool;
+
+    /// Set the object's workspace.
+    ///
+    /// Used by the persistence layer to backfill `workspace` from the
+    /// authoritative DB column into the decoded message when the payload's
+    /// own field is empty (legacy rows written before the workspace column
+    /// existed; see `decode_record` in `openshell-server::persistence`).
+    fn set_object_workspace(&mut self, workspace: &str);
 }
 
 // Implementations for Sandbox
@@ -81,6 +89,11 @@ impl ObjectWorkspace for Sandbox {
     }
     fn requires_workspace() -> bool {
         true
+    }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
     }
 }
 
@@ -145,6 +158,9 @@ impl ObjectWorkspace for Workspace {
     fn requires_workspace() -> bool {
         false
     }
+    fn set_object_workspace(&mut self, _workspace: &str) {
+        // A Workspace does not belong to another workspace; nothing to set.
+    }
 }
 
 // Implementations for Provider
@@ -186,6 +202,11 @@ impl ObjectWorkspace for Provider {
     }
     fn requires_workspace() -> bool {
         true
+    }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
     }
 }
 
@@ -229,6 +250,11 @@ impl ObjectWorkspace for StoredProviderProfile {
     fn requires_workspace() -> bool {
         false
     }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
+    }
 }
 
 // Implementations for StoredProviderCredentialRefreshState
@@ -270,6 +296,11 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshState {
     }
     fn requires_workspace() -> bool {
         true
+    }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
     }
 }
 
@@ -313,6 +344,11 @@ impl ObjectWorkspace for SshSession {
     fn requires_workspace() -> bool {
         true
     }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
+    }
 }
 
 // Implementations for ServiceEndpoint
@@ -354,6 +390,11 @@ impl ObjectWorkspace for ServiceEndpoint {
     }
     fn requires_workspace() -> bool {
         true
+    }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
     }
 }
 
@@ -397,6 +438,11 @@ impl ObjectWorkspace for InferenceRoute {
     fn requires_workspace() -> bool {
         true
     }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
+    }
 }
 
 // Implementations for WorkspaceMember
@@ -439,6 +485,11 @@ impl ObjectWorkspace for WorkspaceMember {
     fn requires_workspace() -> bool {
         true
     }
+    fn set_object_workspace(&mut self, workspace: &str) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.workspace = workspace.to_string();
+        }
+    }
 }
 
 // Implementations for ObjectForTest (test-only proto type)
@@ -480,5 +531,8 @@ impl ObjectWorkspace for ObjectForTest {
     }
     fn requires_workspace() -> bool {
         false
+    }
+    fn set_object_workspace(&mut self, _workspace: &str) {
+        // ObjectForTest doesn't have metadata, so this is a no-op
     }
 }
