@@ -67,9 +67,28 @@ message NetworkPolicyRule {
   repeated NetworkBinary binaries = 3;
   // Credential keys this policy's binaries are allowed to resolve.
   // When empty, all credentials are resolvable (backward compatible).
+  //
   // FORK NOTE: field 4 is fork-claimed by openlock for per-binary credential
-  // scoping. If upstream adds a NetworkPolicyRule field at slot 4, prepare a
-  // wire migration before merging.
+  // scoping — the core moat. It predates the convention that puts fork-added
+  // fields at 9000+, so it sits inside the range upstream appends to
+  // sequentially. A `= 9[0-9]{3}` grep will never surface it.
+  //
+  // Detection is automatic, so do not add a bespoke guard: if upstream ever
+  // adds a NetworkPolicyRule field at slot 4, protoc hard-fails the build with
+  // "Field number 4 has already been used in NetworkPolicyRule by field
+  // allowed_secrets". You will hit it during the sync, before any release.
+  //
+  // WHEN THAT HAPPENS, DO NOT SIMPLY RENUMBER THIS FIELD. Absence is
+  // indistinguishable from empty on the wire, and empty means "all credentials
+  // resolvable" (see query_allowed_secrets in supervisor-network/src/proxy.rs:
+  // the empty arm hands back an UNFILTERED resolver). So a bare renumber makes
+  // a version-mismatched peer silently lose per-binary scoping — fail-open, on
+  // the moat. Released fork binaries v0.5.x–v0.7.1 ship this field at 4.
+  //
+  // The safe migration is three-phase (bd openlock-8kx):
+  //   1. add `allowed_secrets_v2 = 9005`; write BOTH, read 9005 else fall back to 4
+  //   2. ship, and wait until no deployed gateway/supervisor pair predates that release
+  //   3. only then `reserved 4; reserved "allowed_secrets";` and drop the dual write
   repeated string allowed_secrets = 4;
 }
 
