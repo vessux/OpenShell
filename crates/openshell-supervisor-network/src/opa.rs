@@ -2719,6 +2719,19 @@ process:
         val == regorus::Value::from(true)
     }
 
+    /// Evaluate an arbitrary `data.openshell.sandbox.<rule>` boolean rule
+    /// (e.g. `deny_trust_critical`, `audit_trust_critical_inexact`) against
+    /// the given input. Unlike `eval_l7`, this doesn't assume the rule name
+    /// is `allow_request`.
+    fn eval_rule_bool(engine: &OpaEngine, input: &serde_json::Value, rule: &str) -> bool {
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule(format!("data.openshell.sandbox.{rule}"))
+            .unwrap();
+        val == regorus::Value::from(true)
+    }
+
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
         let mut engine = regorus::Engine::new();
         engine
@@ -3136,6 +3149,109 @@ network_policies:
             }]),
         );
         assert!(!eval_l7(&engine, &input));
+    }
+
+    // --- openlock fork: trust_check (openlock-1ft) ---
+    //
+    // Coverage for the exactness gate on `deny_trust_critical`: a critical
+    // vulnerability on a version that was actually requested must still
+    // deny; the same finding against a version merely defaulted from a
+    // versionless request (e.g. an npm packument GET for a self-update
+    // check) must be allowed-with-audit instead, never a hard deny.
+
+    fn trust_json(critical_vulns: u32, version_is_exact: bool) -> serde_json::Value {
+        serde_json::json!({
+            "package": "@anthropic-ai/claude-code",
+            "version": "2.1.98",
+            "version_is_exact": version_is_exact,
+            "registry": "npm",
+            "critical_vulns": critical_vulns,
+            "high_vulns": 0,
+            "medium_vulns": 0,
+            "low_vulns": 0,
+            "license": "MIT",
+            "is_stale": false,
+            "lookup_failed": false,
+        })
+    }
+
+    #[test]
+    fn trust_critical_exact_version_is_denied() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(1, true);
+        assert!(
+            eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "exact-version critical finding should set deny_trust_critical"
+        );
+        assert!(
+            !eval_rule_bool(&engine, &input, "audit_trust_critical_inexact"),
+            "exact-version critical finding must not also be classified as audit-only"
+        );
+        assert!(
+            !eval_l7(&engine, &input),
+            "request naming a version with a critical vulnerability must be denied"
+        );
+    }
+
+    #[test]
+    fn trust_critical_defaulted_version_is_audited_not_denied() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(1, false);
+        assert!(
+            !eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "a defaulted (non-exact) version must never trigger deny_trust_critical"
+        );
+        assert!(
+            eval_rule_bool(&engine, &input, "audit_trust_critical_inexact"),
+            "a defaulted (non-exact) version with a critical finding should be audit-flagged"
+        );
+        assert!(
+            eval_l7(&engine, &input),
+            "a versionless request must not be denied on a version nobody asked for"
+        );
+    }
+
+    #[test]
+    fn trust_critical_missing_exactness_field_fails_closed_to_deny() {
+        // No `version_is_exact` key at all -- must NOT silently degrade to
+        // allow-everything. Absence falls to the restrictive branch (treated
+        // as exact, still denied), same "absent != empty" direction as the
+        // credential moat's `allowed_secrets` field.
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = serde_json::json!({
+            "package": "@anthropic-ai/claude-code",
+            "version": "2.1.98",
+            "registry": "npm",
+            "critical_vulns": 1,
+            "high_vulns": 0,
+            "medium_vulns": 0,
+            "low_vulns": 0,
+            "license": "MIT",
+            "is_stale": false,
+            "lookup_failed": false,
+        });
+        assert!(
+            eval_rule_bool(&engine, &input, "deny_trust_critical"),
+            "an absent version_is_exact must fail closed (still deny), not fail open"
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn trust_no_vulns_is_allowed_regardless_of_exactness() {
+        let engine = l7_engine();
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["trust"] = trust_json(0, false);
+        assert!(eval_l7(&engine, &input));
+        assert!(!eval_rule_bool(&engine, &input, "deny_trust_critical"));
+        assert!(!eval_rule_bool(
+            &engine,
+            &input,
+            "audit_trust_critical_inexact"
+        ));
     }
 
     #[test]

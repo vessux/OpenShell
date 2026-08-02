@@ -979,12 +979,17 @@ where
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                     .firewall_rule(&ctx.policy_name, "trust")
                     .message(format!(
-                        "TRUST_LOOKUP_FAILED {} {}@{} — allowing (fail-open)",
-                        request_info.action, trust.package_name, trust.version,
+                        "TRUST_LOOKUP_FAILED {} {} — allowing (fail-open)",
+                        request_info.action,
+                        trust_version_desc(trust),
                     ))
                     .build();
                 ocsf_emit!(event);
-            } else if trust.critical_vulns > 0 {
+            } else if trust.critical_vulns > 0 && trust.version_is_exact {
+                // Enforcement-eligible: the version came from the request
+                // itself, so it's meaningful to block on it. Must stay in
+                // sync with `deny_trust_critical` in sandbox-policy.rego,
+                // which gates on the same `version_is_exact` signal.
                 let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Other)
                     .action(ActionId::Denied)
@@ -997,11 +1002,38 @@ where
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                     .firewall_rule(&ctx.policy_name, "trust")
                     .message(format!(
-                        "TRUST_DENIED {} {}@{} — {} critical vulnerabilities",
+                        "TRUST_DENIED {} {} — {} critical {}",
                         request_info.action,
-                        trust.package_name,
-                        trust.version,
+                        trust_version_desc(trust),
                         trust.critical_vulns,
+                        vuln_plural(trust.critical_vulns),
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            } else if trust.critical_vulns > 0 {
+                // Critical vulnerabilities were found, but only against a
+                // defaulted (non-exact) version -- e.g. a versionless npm
+                // packument GET for a self-update check. Nobody requested
+                // or is about to install that specific version, so this is
+                // NOT enforced (see openlock-1ft); logged as audit-visible
+                // instead of denied, matching the Rego policy's
+                // `audit_trust_critical_inexact` rule.
+                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Medium)
+                    .http_request(HttpRequest::new(
+                        &request_info.action,
+                        OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .firewall_rule(&ctx.policy_name, "trust")
+                    .message(format!(
+                        "TRUST_AUDIT {} {} — {} critical {} (not enforced: version not requested)",
+                        request_info.action,
+                        trust_version_desc(trust),
+                        trust.critical_vulns,
+                        vuln_plural(trust.critical_vulns),
                     ))
                     .build();
                 ocsf_emit!(event);
@@ -1017,8 +1049,11 @@ where
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                     .firewall_rule(&ctx.policy_name, "trust")
                     .message(format!(
-                        "TRUST_AUDIT {} {}@{} — {} high vulnerabilities",
-                        request_info.action, trust.package_name, trust.version, trust.high_vulns,
+                        "TRUST_AUDIT {} {} — {} high {}",
+                        request_info.action,
+                        trust_version_desc(trust),
+                        trust.high_vulns,
+                        vuln_plural(trust.high_vulns),
                     ))
                     .build();
                 ocsf_emit!(event);
@@ -1176,6 +1211,33 @@ where
                 .await?;
             return Ok(());
         }
+    }
+}
+
+/// "vulnerability" for a singular count, "vulnerabilities" otherwise.
+fn vuln_plural(n: u32) -> &'static str {
+    if n == 1 {
+        "vulnerability"
+    } else {
+        "vulnerabilities"
+    }
+}
+
+/// Renders a trust-checked package reference for log messages. Makes clear
+/// when `version` was defaulted (deps.dev's most-recently-indexed version)
+/// rather than named in the request itself, so operators never read a
+/// defaulted version as "the version that was requested/installed"
+/// (openlock-1ft).
+fn trust_version_desc(trust: &crate::trust::TrustResult) -> String {
+    if trust.version_is_exact {
+        format!("{}@{}", trust.package_name, trust.version)
+    } else if trust.version.is_empty() {
+        trust.package_name.clone()
+    } else {
+        format!(
+            "{} (unversioned request; matched indexed version {})",
+            trust.package_name, trust.version
+        )
     }
 }
 
@@ -2084,6 +2146,7 @@ fn evaluate_l7_request_once(
         input_json["trust"] = serde_json::json!({
             "package": trust.package_name,
             "version": trust.version,
+            "version_is_exact": trust.version_is_exact,
             "registry": trust.registry,
             "critical_vulns": trust.critical_vulns,
             "high_vulns": trust.high_vulns,
@@ -2337,6 +2400,65 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+
+    fn trust_result(
+        version: &str,
+        version_is_exact: bool,
+        critical_vulns: u32,
+    ) -> crate::trust::TrustResult {
+        crate::trust::TrustResult::for_test(
+            "@anthropic-ai/claude-code",
+            version,
+            version_is_exact,
+            critical_vulns,
+        )
+    }
+
+    #[test]
+    fn vuln_plural_singular() {
+        assert_eq!(vuln_plural(1), "vulnerability");
+    }
+
+    #[test]
+    fn vuln_plural_zero_and_many() {
+        assert_eq!(vuln_plural(0), "vulnerabilities");
+        assert_eq!(vuln_plural(2), "vulnerabilities");
+        assert_eq!(vuln_plural(3), "vulnerabilities");
+    }
+
+    #[test]
+    fn trust_version_desc_exact_shows_at_version() {
+        let trust = trust_result("2.1.212", true, 1);
+        assert_eq!(
+            trust_version_desc(&trust),
+            "@anthropic-ai/claude-code@2.1.212"
+        );
+    }
+
+    #[test]
+    fn trust_version_desc_inexact_never_asserts_the_defaulted_version_as_requested() {
+        // openlock-1ft: a versionless packument GET must never be described
+        // as if the client asked for/installed the resolved default version.
+        let trust = trust_result("2.1.98", false, 1);
+        let desc = trust_version_desc(&trust);
+        assert!(
+            !desc.contains("@2.1.98"),
+            "must not render as package@version (implies the request named it): {desc}"
+        );
+        assert!(
+            desc.contains("2.1.98"),
+            "should still surface the matched version: {desc}"
+        );
+        assert!(desc.contains("unversioned request"), "{desc}");
+    }
+
+    #[test]
+    fn trust_version_desc_inexact_empty_version_omits_version() {
+        // lookup_failed before any default could be resolved: no version at
+        // all, versioned-vs-unversioned wording would be misleading either way.
+        let trust = trust_result("", false, 0);
+        assert_eq!(trust_version_desc(&trust), "@anthropic-ai/claude-code");
+    }
 
     fn install_builtin_middleware(engine: &OpaEngine) {
         engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(

@@ -437,6 +437,14 @@ request_deny_reason := reason if {
 }
 
 # openlock fork: trust-API critical-vuln deny reason takes precedence over generic deny rule reason.
+#
+# `deny_trust_critical` (above) only ever fires when `version_is_exact` is
+# `true` or absent -- never when it is explicitly `false` -- so `version`
+# here is always the version the request actually named (or, in the
+# defensive absent-field fallback, presumed to be). It can no longer name a
+# defaulted/unrequested version the way it could before openlock-1ft: a
+# versionless request with a critical-vuln default version is routed to
+# `audit_trust_critical_inexact` instead of here.
 request_deny_reason := reason if {
 	input.trust
 	deny_trust_critical
@@ -970,10 +978,35 @@ matched_allowed_secrets := secrets if {
 # openlock fork additions: trust_check
 ########################################
 
-# Deny if package has critical vulnerabilities.
+# Deny if package has critical vulnerabilities AND the version was the one
+# actually named in the request. A versionless (packument) request -- e.g. an
+# npm self-update check -- has no specific version in play: the resolved
+# "version" is only a stand-in (deps.dev's most-recently-indexed version),
+# which can be stale/arbitrary relative to the real registry and to what the
+# client will actually install, so it must not trigger a hard deny
+# (openlock-1ft). See `audit_trust_critical_inexact` for that case.
+#
+# Fail-closed default: `object.get(..., true)` means an ABSENT
+# `version_is_exact` is treated as exact (still subject to deny), never as
+# "not exact" (which would silently downgrade this rule to allow-everything
+# whenever the exactness signal is missing). Absence must never read as
+# permissive here -- same "absent != empty" principle as the credential
+# moat's `allowed_secrets` field.
 deny_trust_critical if {
 	input.trust
 	input.trust.critical_vulns > 0
+	object.get(input.trust, "version_is_exact", true) == true
+}
+
+# Audit (allow but log), never deny, when critical vulnerabilities were found
+# against a version that was explicitly marked non-exact -- i.e. defaulted
+# from a versionless request, not named by the client. This only fires when
+# `version_is_exact` is explicitly `false`; if the field is absent,
+# `deny_trust_critical` above applies instead (fail-closed).
+audit_trust_critical_inexact if {
+	input.trust
+	input.trust.critical_vulns > 0
+	input.trust.version_is_exact == false
 }
 
 # Audit (allow but log) if package has high vulnerabilities.

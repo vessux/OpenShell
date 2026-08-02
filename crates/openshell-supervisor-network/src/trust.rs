@@ -175,6 +175,16 @@ fn parse_npm_metadata(path: &str) -> Option<PackageRef> {
 pub struct TrustResult {
     pub package_name: String,
     pub version: String,
+    /// True when `version` is the version the request actually named.
+    /// False when the request carried no version (e.g. a bare npm packument
+    /// GET) and `version` was defaulted via `resolve_default_version` --
+    /// deps.dev's most-recently-ingested version for the package, which can
+    /// lag real registry state and must never be presented as, or enforced
+    /// as, the version the client requested or will install. Consumers
+    /// (log messages, policy) must treat `false` as "unproven exact match",
+    /// not as "empty"/absent -- see `deny_trust_critical` in
+    /// sandbox-policy.rego for the enforcement-side gate on this flag.
+    pub version_is_exact: bool,
     pub registry: String,
     pub critical_vulns: u32,
     pub high_vulns: u32,
@@ -184,6 +194,35 @@ pub struct TrustResult {
     pub is_stale: bool,
     pub lookup_failed: bool,
     fetched_at: Instant,
+}
+
+impl TrustResult {
+    /// Test-only constructor for callers outside this module (e.g.
+    /// `l7::relay` message-formatting tests) that need a `TrustResult`
+    /// without going through `fetch_trust`'s network path. `fetched_at` is
+    /// private to keep cache-freshness accounting internal to this module.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        package_name: &str,
+        version: &str,
+        version_is_exact: bool,
+        critical_vulns: u32,
+    ) -> Self {
+        Self {
+            package_name: package_name.to_string(),
+            version: version.to_string(),
+            version_is_exact,
+            registry: "npm".to_string(),
+            critical_vulns,
+            high_vulns: 0,
+            medium_vulns: 0,
+            low_vulns: 0,
+            license: "UNKNOWN".to_string(),
+            is_stale: false,
+            lookup_failed: false,
+            fetched_at: Instant::now(),
+        }
+    }
 }
 
 pub struct TrustCache {
@@ -234,9 +273,11 @@ fn cache_key(pkg: &PackageRef) -> String {
 async fn fetch_trust(client: &reqwest::Client, pkg: &PackageRef) -> TrustResult {
     let fetch_start = Instant::now();
     tracing::debug!(package = %pkg.name, version = ?pkg.version, "trust: starting fetch");
+    let version_is_exact = pkg.version.is_some();
     let failed = TrustResult {
         package_name: pkg.name.clone(),
         version: pkg.version.clone().unwrap_or_default(),
+        version_is_exact,
         registry: pkg.registry.deps_dev_system().to_string(),
         critical_vulns: 0,
         high_vulns: 0,
@@ -312,6 +353,7 @@ async fn fetch_trust(client: &reqwest::Client, pkg: &PackageRef) -> TrustResult 
     TrustResult {
         package_name: pkg.name.clone(),
         version: version.clone(),
+        version_is_exact,
         registry: pkg.registry.deps_dev_system().to_string(),
         critical_vulns: critical,
         high_vulns: high,
@@ -396,6 +438,23 @@ async fn resolve_default_version(
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
+    extract_default_version(&body)
+}
+
+/// Picks a stand-in "default" version from a deps.dev package-listing
+/// response body, for use when the original request carried no version
+/// (e.g. a bare npm packument GET).
+///
+/// This is the LAST entry in `versions`. deps.dev appears to return that
+/// array in ascending publish order, so `.last()` is deps.dev's own
+/// most-recently-ingested version -- NOT necessarily the registry's real
+/// `dist-tags.latest`, and it can lag well behind current registry state
+/// for fast-releasing packages (verified live against
+/// `@anthropic-ai/claude-code` on 2026-07-30: deps.dev's indexed tip was
+/// `2.1.98` while the real npm latest was already past `2.1.212`). Callers
+/// must never present the result as "the version that was requested" --
+/// see `TrustResult::version_is_exact`.
+fn extract_default_version(body: &serde_json::Value) -> Option<String> {
     body.get("versions")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.last())
@@ -518,6 +577,40 @@ mod tests {
             version: None,
         };
         assert_eq!(cache_key(&pkg), "npm:express:latest");
+    }
+
+    #[test]
+    fn extract_default_version_picks_last_entry() {
+        // Fixture shaped like https://api.deps.dev/v3alpha/systems/npm/packages/<name>.
+        // deps.dev's `versions` array is ascending, so `.last()` is whatever
+        // deps.dev has most recently ingested -- pinning that "last of array"
+        // selection without touching the live network (openlock-1ft).
+        let body = serde_json::json!({
+            "versions": [
+                {"versionKey": {"system": "npm", "name": "@anthropic-ai/claude-code", "version": "2.1.96"}},
+                {"versionKey": {"system": "npm", "name": "@anthropic-ai/claude-code", "version": "2.1.97"}},
+                {"versionKey": {"system": "npm", "name": "@anthropic-ai/claude-code", "version": "2.1.98"}},
+            ]
+        });
+        assert_eq!(extract_default_version(&body), Some("2.1.98".to_string()));
+    }
+
+    #[test]
+    fn extract_default_version_missing_versions_field() {
+        let body = serde_json::json!({});
+        assert_eq!(extract_default_version(&body), None);
+    }
+
+    #[test]
+    fn extract_default_version_empty_versions_array() {
+        let body = serde_json::json!({"versions": []});
+        assert_eq!(extract_default_version(&body), None);
+    }
+
+    #[test]
+    fn extract_default_version_malformed_entry() {
+        let body = serde_json::json!({"versions": [{"versionKey": {}}]});
+        assert_eq!(extract_default_version(&body), None);
     }
 
     #[tokio::test]
