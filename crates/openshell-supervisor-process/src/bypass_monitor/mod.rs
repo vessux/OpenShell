@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bypass detection monitor — reads kernel log messages from `/dev/kmsg` to
-//! detect and report direct connection attempts that bypass the HTTP CONNECT
-//! proxy.
+//! Bypass detection monitor — tails kernel log messages via `dmesg --follow`
+//! to detect and report direct connection attempts that bypass the HTTP
+//! CONNECT proxy.
 //!
 //! When the sandbox network namespace has nftables log rules installed (see
 //! `NetworkNamespace::install_bypass_rules`), the kernel writes a log line for
@@ -12,22 +12,37 @@
 //!
 //! ## Graceful degradation
 //!
-//! If `/dev/kmsg` cannot be opened (e.g., restricted container environment),
-//! the monitor logs a one-time warning and returns. The nftables reject rules
-//! still provide fast-fail UX — the monitor only adds diagnostic visibility.
+//! Reading the kernel ring buffer requires `CAP_SYSLOG` to be satisfied
+//! against the *initial* user namespace (`kernel.dmesg_restrict`). Rootful
+//! container runtimes typically satisfy that directly; rootless runtimes that
+//! nest the user namespace (e.g. rootless Podman) cannot — `cap_add
+//! CAP_SYSLOG` only grants the capability inside the nested namespace, and
+//! the kernel check is against the outer one, so the read fails with EPERM
+//! even though the capability is present. Since this varies by runtime and
+//! configuration, availability is probed empirically at startup with a real
+//! read rather than assumed.
+//!
+//! If the probe (or the `dmesg --follow` reader itself) fails, the monitor
+//! reports itself **degraded** — a `ConfigStateChange` OCSF event plus a
+//! `warn!` log, emitted once per monitor lifetime — and stops. This is not
+//! fatal: the nftables REJECT rules installed by
+//! `NetworkNamespace::install_bypass_rules` still provide fast-fail UX
+//! independent of this monitor; only the diagnostic visibility into bypass
+//! attempts is lost.
 
 mod procfs;
 
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
 use openshell_ocsf::{
-    ActionId, ActivityId, ConfidenceId, DetectionFindingBuilder, DispositionId, Endpoint,
-    FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
+    ActionId, ActivityId, ConfidenceId, ConfigStateChangeBuilder, DetectionFindingBuilder,
+    DispositionId, Endpoint, FindingInfo, NetworkActivityBuilder, Process, SeverityId, StateId,
+    StatusId, ocsf_emit,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A parsed nftables log entry from `/dev/kmsg`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +108,75 @@ fn extract_field(s: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Report the bypass monitor as degraded: it could not read the kernel ring
+/// buffer, so bypass attempts will not be logged or aggregated. The
+/// nftables REJECT rules installed by `NetworkNamespace::install_bypass_rules`
+/// are a separate mechanism and still provide fast-fail UX.
+///
+/// Callers must invoke this at most once per monitor lifetime (on the
+/// startup probe failing, or on the `dmesg --follow` reader exiting) —
+/// never per read attempt or loop iteration — so a degraded monitor cannot
+/// turn into a log-volume problem of its own.
+fn report_degraded(reason: &str) {
+    warn!(
+        reason,
+        "Bypass detection monitor degraded: kernel ring buffer read failed; \
+         nftables REJECT rules still provide fast-fail, but bypass attempts \
+         will not be logged"
+    );
+    let event = ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .state(StateId::Disabled, "degraded")
+        .message(format!(
+            "Bypass detection monitor degraded: {reason}. nftables REJECT rules \
+             still provide fast-fail; diagnostic visibility into bypass attempts \
+             is unavailable."
+        ))
+        .build();
+    ocsf_emit!(event);
+}
+
+/// Describe why a process exited unsuccessfully, preferring its own stderr
+/// (e.g. `read kernel buffer failed: Operation not permitted`) over the bare
+/// exit status.
+fn describe_failure(status: std::process::ExitStatus, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("exited with {status}")
+    } else {
+        stderr.to_string()
+    }
+}
+
+/// Probe whether reading the kernel ring buffer via `program args...` is
+/// actually permitted, by running it to completion (no `--follow`) and
+/// checking its exit status.
+///
+/// This is the real-read gate that replaces `dmesg --version`: `--version`
+/// only proves the binary execs, which says nothing about whether
+/// `kernel.dmesg_restrict` will let the read itself succeed. Under a nested
+/// user namespace (rootless Podman) the read fails with EPERM even though
+/// `dmesg` execs fine and `CAP_SYSLOG` is present in the container's own
+/// capability set — see the module docs.
+fn probe_ring_buffer_read(program: &str, args: &[&str]) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    match Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(describe_failure(
+            output.status,
+            &String::from_utf8_lossy(&output.stderr),
+        )),
+        Err(e) => Err(format!("failed to exec {program}: {e}")),
+    }
+}
+
 /// Generate a protocol-appropriate hint for the bypass event.
 fn hint_for_event(event: &BypassEvent) -> &'static str {
     if event.proto == "udp" && event.dst_port == 53 {
@@ -107,42 +191,31 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
 /// Spawn the bypass monitor as a background tokio task.
 ///
 /// Uses `dmesg --follow` to tail the kernel ring buffer for nftables log
-/// entries matching the given namespace. Falls back gracefully if `dmesg`
-/// is not available.
+/// entries matching the given namespace.
 ///
 /// We use `dmesg` rather than reading `/dev/kmsg` directly because the
 /// container runtime's device cgroup policy blocks direct `/dev/kmsg` access
 /// even with `CAP_SYSLOG`. The `dmesg` command reads via the `syslog(2)`
-/// syscall which is permitted with `CAP_SYSLOG`.
+/// syscall which is permitted with `CAP_SYSLOG` — *when* that capability is
+/// checked against the same user namespace it was granted in; see the module
+/// docs for why that can still fail under rootless runtimes.
 ///
-/// Returns a `JoinHandle` if the monitor was started, or `None` if `dmesg`
-/// is not available.
+/// Returns a `JoinHandle` if the monitor started, or `None` if the kernel
+/// ring buffer could not be read (reported as degraded; see
+/// `report_degraded`).
 pub fn spawn(
     namespace_name: String,
     entrypoint_pid: Arc<AtomicU32>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
     use std::process::{Command, Stdio};
 
-    // Verify dmesg is available before spawning the monitor.
-    let dmesg_check = Command::new("dmesg")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    if !dmesg_check.is_ok_and(|s| s.success()) {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .severity(SeverityId::Low)
-            .message(
-                "dmesg not available; bypass detection monitor will not run. \
-                 Bypass REJECT rules still provide fast-fail behavior.",
-            )
-            .build();
-        ocsf_emit!(event);
+    // A one-shot (non-follow) read exercises the same permission check as
+    // `--follow` without blocking.
+    if let Err(reason) = probe_ring_buffer_read("dmesg", &["--notime"]) {
+        report_degraded(&reason);
         return None;
     }
 
@@ -157,32 +230,35 @@ pub fn spawn(
         let mut child = match Command::new("dmesg")
             .args(["--follow", "--notime"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
             Err(e) => {
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .message(format!(
-                        "Failed to start dmesg --follow; bypass monitor will not run: {e}"
-                    ))
-                    .build();
-                ocsf_emit!(event);
+                report_degraded(&format!("failed to start dmesg --follow: {e}"));
                 return;
             }
         };
 
         let Some(stdout) = child.stdout.take() else {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Other)
-                .severity(SeverityId::Low)
-                .message("dmesg --follow produced no stdout; bypass monitor will not run")
-                .build();
-            ocsf_emit!(event);
+            report_degraded("dmesg --follow produced no stdout");
+            let _ = child.kill();
+            let _ = child.wait();
             return;
         };
+
+        // Drain stderr on a separate thread so a full pipe buffer never
+        // blocks the follow reader; the captured text is only used if the
+        // reader loop below ends (which — absent an external kill during
+        // supervisor shutdown — means dmesg itself exited or failed) so we
+        // can report *why*, instead of silently discarding it as before.
+        let stderr_capture = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = stderr.read_to_string(&mut buf);
+                buf
+            })
+        });
 
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
@@ -286,10 +362,25 @@ pub fn spawn(
             }
         }
 
-        // Clean up the dmesg child process.
+        // The reader loop above only ends when dmesg's stdout pipe closes —
+        // nothing else in this task closes it, so that means dmesg itself
+        // exited or failed (absent an external kill during supervisor
+        // shutdown, in which case the whole process is going away anyway).
+        // Report why, once, instead of the previous silent best-effort
+        // kill+wait.
         let _ = child.kill();
-        let _ = child.wait();
-        debug!("Bypass monitor: dmesg reader exited");
+        let stderr_text = stderr_capture.and_then(|h| h.join().ok());
+        match child.wait() {
+            Ok(status) if status.success() => {
+                debug!("Bypass monitor: dmesg reader exited");
+            }
+            Ok(status) => {
+                report_degraded(&describe_failure(status, &stderr_text.unwrap_or_default()));
+            }
+            Err(e) => {
+                report_degraded(&format!("failed to wait on dmesg --follow: {e}"));
+            }
+        }
     });
 
     Some(handle)
@@ -375,6 +466,71 @@ fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_ring_buffer_read_ok_on_success() {
+        assert_eq!(probe_ring_buffer_read("true", &[]), Ok(()));
+    }
+
+    #[test]
+    fn probe_ring_buffer_read_surfaces_stderr_reason_on_failure() {
+        // Simulates the measured real-world failure: the binary execs fine
+        // (this is exactly what `dmesg --version` would have missed) but the
+        // read itself fails and says why on stderr.
+        let err = probe_ring_buffer_read(
+            "sh",
+            &[
+                "-c",
+                "echo 'read kernel buffer failed: Operation not permitted' >&2; exit 1",
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err, "read kernel buffer failed: Operation not permitted");
+    }
+
+    #[test]
+    fn probe_ring_buffer_read_falls_back_to_exit_status_without_stderr() {
+        let err = probe_ring_buffer_read("sh", &["-c", "exit 1"]).unwrap_err();
+        assert!(
+            err.contains("exited with"),
+            "expected a status-based reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_ring_buffer_read_reports_exec_failure() {
+        let err = probe_ring_buffer_read("openshell-bypass-monitor-test-no-such-binary", &[])
+            .unwrap_err();
+        assert!(
+            err.contains("failed to exec"),
+            "expected an exec-failure reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn describe_failure_prefers_stderr_over_status() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("run sh");
+        assert_eq!(
+            describe_failure(status, "  Operation not permitted  \n"),
+            "Operation not permitted"
+        );
+    }
+
+    #[test]
+    fn describe_failure_falls_back_to_status_when_stderr_empty() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("run sh");
+        let reason = describe_failure(status, "");
+        assert!(
+            reason.contains("exited with"),
+            "expected a status-based reason, got: {reason}"
+        );
+    }
 
     #[test]
     fn parse_kmsg_line_tcp_bypass() {
