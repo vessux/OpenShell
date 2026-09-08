@@ -916,6 +916,26 @@ impl PodmanComputeDriver {
                 } else {
                     None
                 };
+                // Fork addition: resolve the image's declared user so the
+                // bind-mount-triggered `keep-id` userns-remap (see
+                // `has_bind_mount` in build_container_spec_for_image) can map
+                // container UID/GID back to the image's own sandbox user
+                // instead of the community default.
+                let image_sandbox_user = if container::podman_config_has_bind_mount(
+                    sandbox,
+                    self.config.enable_bind_mounts,
+                ) {
+                    let image_ref = container::resolve_image(sandbox, &self.config);
+                    match self.client.image_user(image_ref).await {
+                        Ok(u) => Some(u),
+                        Err(e) => {
+                            cleanup_created().await;
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 let tls_secret_names = if userns_remaps_uids(self.config.userns.as_deref())
                     && self.config.tls_enabled()
@@ -947,6 +967,7 @@ impl PodmanComputeDriver {
                     &image_user,
                     supervisor_bin_path.as_deref(),
                     tls_secret_names.as_ref(),
+                    image_sandbox_user,
                 ) {
                     Ok(spec) => spec,
                     Err(e) => {
@@ -2569,6 +2590,7 @@ mod tests {
             &driver.config,
             None,
             Some(&first_devices),
+            None,
         )
         .unwrap();
 
@@ -2582,6 +2604,7 @@ mod tests {
             &driver.config,
             None,
             Some(&second_devices),
+            None,
         )
         .unwrap();
 

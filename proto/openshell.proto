@@ -840,6 +840,13 @@ message SandboxSpec {
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the main process.
   bool tty = 13;
+  // Field 9003 was `volumes` (fork-added `BindVolume` passthrough for the
+  // `--volume HOST:CONTAINER[:ro]` CLI flag). Removed: bind mounts now flow
+  // through the upstream `SandboxTemplate.driver_config` envelope (driver
+  // -config-json), which already supports typed bind/volume/tmpfs/image
+  // mounts. Reserved rather than reused per fork field-number policy.
+  reserved 9003;
+  reserved "volumes";
 }
 
 message ResourceRequirements {

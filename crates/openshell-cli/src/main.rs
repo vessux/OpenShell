@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_cli::volume_spec;
 use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
@@ -1481,6 +1482,26 @@ enum SandboxCommands {
         /// default-deny posture is preserved unless you choose otherwise.
         #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
         approval_mode: String,
+        /// Bind-mount a host path into the sandbox.
+        ///
+        /// Format: `<HOST_PATH>:<CONTAINER_PATH>[:ro]`. Repeatable.
+        /// Host path must be absolute and exist. Container path must be
+        /// absolute. The optional `:ro` suffix makes the mount read-only.
+        ///
+        /// Sugar over `--driver-config-json`: translates to a bind mount
+        /// entry under the active driver's block. Requires
+        /// `enable_bind_mounts = true` under `[openshell.drivers.podman]` or
+        /// `[openshell.drivers.docker]` on the gateway.
+        ///
+        /// On rootless podman, the driver auto-applies
+        /// `--userns=keep-id:uid=<image-sandbox-uid>,gid=<image-sandbox-gid>`
+        /// when any bind mount is present, so bind file ownership maps
+        /// bidirectionally between host and container.
+        ///
+        /// Not supported on the vm driver: sandbox creation fails with
+        /// "bind mounts not supported on vm driver".
+        #[arg(long = "volume", help_heading = "MOUNT FLAGS")]
+        volumes: Vec<String>,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
@@ -3013,6 +3034,7 @@ async fn run_async() -> Result<()> {
                     no_credential_warnings,
                     approval_mode,
                     output,
+                    volumes,
                     command,
                     log_level,
                 } => {
@@ -3075,6 +3097,13 @@ async fn run_async() -> Result<()> {
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
+                    // Parse --volume specs into BindVolumeSpec entries.
+                    let parsed_volumes = volumes
+                        .iter()
+                        .map(|s| volume_spec::parse_volume_spec(s))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| miette::miette!("{}", e))?;
+
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
@@ -3103,6 +3132,7 @@ async fn run_async() -> Result<()> {
                             approval_mode: &approval_mode,
                             output: output.as_str(),
                             detach,
+                            volumes: &parsed_volumes,
                             log_level: log_level.as_deref(),
                         },
                         &cli.workspace,
