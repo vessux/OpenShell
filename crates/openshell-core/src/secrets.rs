@@ -496,9 +496,20 @@ impl SecretResolver {
     ///
     /// Builds the canonical placeholder and delegates to `resolve_placeholder`.
     /// Returns `None` if the key is unknown or the value is invalid.
+    /// Fork: resolve a credential by env key for TRUSTED supervisor code
+    /// (`cred_inject`), the way `resolve_current_env_key_checked` does for
+    /// `SigV4`. This must not go through `resolve_placeholder`: that path
+    /// deliberately refuses the identityless canonical placeholder for an
+    /// endpoint-bound key because it treats its input as sandbox request text,
+    /// and every static credential a `cred_inject` endpoint uses IS endpoint-
+    /// bound since upstream v0.0.116 (fork v0.9.3 binds them by key). The
+    /// per-binary `allowed_secrets` filter still applies: `filtered()` removes
+    /// the key's entries before we get here, and a denied (endpoint-mismatch)
+    /// key is reported as such rather than as "missing".
     pub fn resolve_by_env_key(&self, key: &str) -> Option<&str> {
-        let placeholder = placeholder_for_env_key(key);
-        self.resolve_placeholder(&placeholder)
+        self.resolve_current_env_key_checked(key, "cred_inject")
+            .ok()
+            .flatten()
     }
 
     /// Create a new resolver containing only the specified credential keys.
@@ -1487,8 +1498,11 @@ pub fn apply_cred_inject(
     // Pre-resolve all inject directives up front (fail-closed).
     let mut resolved_injections: Vec<(&str, &str, &str)> = Vec::with_capacity(inject.len());
     for directive in inject {
+        // Trusted key-based lookup (see `resolve_current_env_key_checked`): an
+        // endpoint-denied key surfaces as a typed mismatch, a missing one as
+        // "unavailable"; both fail closed before anything is forwarded.
         let value = resolver
-            .resolve_by_env_key(&directive.from_credential)
+            .resolve_current_env_key_checked(&directive.from_credential, "cred_inject")?
             .ok_or_else(|| UnresolvedPlaceholderError::unavailable("cred_inject"))?;
         resolved_injections.push((&directive.header, &directive.value_prefix, value));
     }

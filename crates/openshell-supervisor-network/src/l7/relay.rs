@@ -1719,12 +1719,11 @@ where
                         // Fork: an echo failure used to surface only as an empty
                         // reply to the client (curl exit 52) with nothing in the
                         // proxy log — undiagnosable from outside the container.
+                        // Message carries the fields inline: the shorthand
+                        // log layer drops structured fields.
                         warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            policy = %ctx.policy_name,
-                            error = %error,
-                            "echo mode failed; closing connection without a response"
+                            "echo mode failed for {}:{} (policy {}); closing connection without a response: {error}",
+                            ctx.host, ctx.port, ctx.policy_name
                         );
                         return Err(error);
                     }
@@ -3308,6 +3307,95 @@ mod tests {
             "no established allowed_secrets scoping must yield no resolver"
         );
         assert_eq!(scoped.provider_credential_revision, Some(7));
+    }
+
+    /// Fork: end-to-end echo through the PRODUCTION data flow — a bound
+    /// provider state exactly as the gateway sends it for a `cred_inject`
+    /// endpoint (v0.9.3 key-based binding), the request-scoped context, then
+    /// `echo_http_request`. Reproduces what the live legs exercise.
+    #[tokio::test]
+    async fn echo_mode_resolves_cred_inject_credential_through_bound_provider_state() {
+        use tokio::io::AsyncReadExt;
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            TestHashMap::from([("TEST_ECHO_VAL".to_string(), "echo-secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "TEST_ECHO_VAL".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "mock.opencode.test".to_string(),
+                        port: 8443,
+                        path: String::new(),
+                    }],
+                    credential_identity: "openlock-test-echo:TEST_ECHO_VAL".to_string(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let ctx = L7EvalContext {
+            host: "mock.opencode.test".to_string(),
+            port: 8443,
+            request_default_port: Some(443),
+            policy_name: "opencode_echo_test".to_string(),
+            provider_credentials: Some(state),
+            allowed_secrets: Some(vec!["TEST_ECHO_VAL".to_string()]),
+            cred_inject: Some(crate::l7::CredInjectConfig {
+                strip_headers: vec!["X-Original-Header".to_string()],
+                inject: vec![secrets::CredInjectDirective {
+                    header: "X-Test-Echo".to_string(),
+                    from_credential: "TEST_ECHO_VAL".to_string(),
+                    value_prefix: String::new(),
+                }],
+            }),
+            echo: true,
+            ..Default::default()
+        };
+        let raw = b"GET / HTTP/1.1\r\nHost: mock.opencode.test:8443\r\nX-Original-Header: original-value\r\n\r\n".to_vec();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::None,
+        };
+        let scoped = scoped_context_for_request(&ctx, &request).expect("scoped context");
+        assert!(
+            scoped.secret_resolver.is_some(),
+            "bound key must yield a resolver"
+        );
+        let (mut client_read, mut client_write) = tokio::io::duplex(8192);
+        let outcome = crate::l7::rest::echo_http_request(
+            &request,
+            &mut client_write,
+            scoped.secret_resolver.as_deref(),
+            scoped.cred_inject.as_ref(),
+            &scoped.policy_name,
+        )
+        .await
+        .expect("echo must succeed through the production data flow");
+        drop(client_write);
+        let _ = outcome;
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let compact: String = response.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("\"cred_inject_applied\":true"),
+            "{response}"
+        );
+        assert!(compact.contains("\"echo\":true"), "{response}");
+        assert!(
+            response.contains("echo-secret"),
+            "injected value must be echoed: {response}"
+        );
+        assert!(
+            !response.to_ascii_lowercase().contains("original-value"),
+            "{response}"
+        );
     }
 
     #[test]
