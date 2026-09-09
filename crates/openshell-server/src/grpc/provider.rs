@@ -1092,10 +1092,12 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
 }
 
 /// Fork: the production builder — `policy_bindings` (upstream `credential_binding`) plus
-/// `cred_inject_bindings`: endpoints the sandbox
-/// policy binds to a provider by naming it in `cred_inject.provider`. Those are
-/// the fork's own explicit declaration, so they are MERGED with the profile /
-/// `credential_binding` endpoints and never trip upstream's
+/// `cred_inject_key_bindings`: keyed by CREDENTIAL ENV KEY, the endpoints whose
+/// `cred_inject.inject[].from_credential` names that key. (`cred_inject.provider`
+/// is a free-form label that never had to match the attached provider's name,
+/// so it cannot be the join key.) Those are the fork's own explicit declaration,
+/// so they are MERGED with the profile / `credential_binding` endpoints for that
+/// key and never trip upstream's
 /// "profile already defines endpoints" / "no provider profile" rejections
 /// (which stay exactly as upstream wrote them for `credential_binding`).
 /// Without this, a binding-capable supervisor never receives the static
@@ -1106,7 +1108,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
-    cred_inject_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    cred_inject_key_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
     credentials: &crate::credentials::CredentialRuntime,
     sandbox_id: Option<&str>,
 ) -> Result<ProviderEnvironment, Status> {
@@ -1171,21 +1173,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
             }
             (None, None) => None,
         };
-        // Fork: merge cred_inject-declared endpoints for this provider (see fn doc).
-        let effective_endpoints: Option<Vec<StaticCredentialEndpointBinding>> =
-            match (effective_endpoints, cred_inject_bindings.get(name)) {
-                (None, None) => None,
-                (base, extra) => {
-                    let mut merged = base.cloned().unwrap_or_default();
-                    for endpoint in extra.into_iter().flatten() {
-                        if !merged.contains(endpoint) {
-                            merged.push(endpoint.clone());
-                        }
-                    }
-                    Some(merged)
-                }
-            };
-        let has_no_usable_endpoint = effective_endpoints.as_ref().is_some_and(Vec::is_empty);
+        let has_no_usable_endpoint = effective_endpoints.is_some_and(Vec::is_empty);
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
 
         for (key, value) in &provider.credentials {
@@ -1200,7 +1188,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
                 continue;
             }
             if is_valid_env_key(key) {
-                if has_no_usable_endpoint {
+                if has_no_usable_endpoint && !cred_inject_key_bindings.contains_key(key) {
                     // Static credentials need a complete binding. Do not send
                     // endpointless profile credentials as invalid metadata,
                     // because one rejected key would revoke every unrelated
@@ -1231,7 +1219,11 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
                 }
                 provider_env.insert(key.clone(), value.clone());
                 static_credential_keys.insert(key.clone());
-                if let Some(endpoints) = effective_endpoints.as_deref() {
+                let endpoints_for_key = cred_inject_endpoints_for_key(
+                    effective_endpoints.map(Vec::as_slice),
+                    cred_inject_key_bindings.get(key),
+                );
+                if let Some(endpoints) = endpoints_for_key.as_deref() {
                     if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
@@ -1272,7 +1264,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
                 continue;
             }
             if is_valid_env_key(&key) {
-                if has_no_usable_endpoint {
+                if has_no_usable_endpoint && !cred_inject_key_bindings.contains_key(&key) {
                     warn!(
                         provider_name = %name,
                         key = %key,
@@ -1290,7 +1282,11 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cr
                 }
                 provider_env.insert(key.clone(), value);
                 static_credential_keys.insert(key.clone());
-                if let Some(endpoints) = effective_endpoints.as_deref() {
+                let endpoints_for_key = cred_inject_endpoints_for_key(
+                    effective_endpoints.map(Vec::as_slice),
+                    cred_inject_key_bindings.get(&key),
+                );
+                if let Some(endpoints) = endpoints_for_key.as_deref() {
                     if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
@@ -1366,6 +1362,27 @@ fn refresh_authorization_epochs_by_key(
         }
     }
     Ok(epochs)
+}
+
+/// Fork: endpoints a static credential key may be resolved at — the provider's
+/// profile / `credential_binding` endpoints plus every `cred_inject` endpoint
+/// that injects from this key. `None` only when neither source says anything.
+fn cred_inject_endpoints_for_key(
+    base: Option<&[StaticCredentialEndpointBinding]>,
+    cred_inject: Option<&Vec<StaticCredentialEndpointBinding>>,
+) -> Option<Vec<StaticCredentialEndpointBinding>> {
+    match (base, cred_inject) {
+        (None, None) => None,
+        (base, extra) => {
+            let mut merged = base.map(<[_]>::to_vec).unwrap_or_default();
+            for endpoint in extra.into_iter().flatten() {
+                if !merged.contains(endpoint) {
+                    merged.push(endpoint.clone());
+                }
+            }
+            Some(merged)
+        }
+    }
 }
 
 fn static_credential_binding(
@@ -9676,8 +9693,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_cred_inject_binding_binds_unprofiled_static_provider() {
-        // Fork: a cred_inject endpoint naming an unprofiled provider is a
-        // binding for that provider's static credentials at that endpoint, so
+        // Fork: a cred_inject endpoint injecting from a credential key is a
+        // binding for that key at that endpoint (whatever provider holds it), so
         // a binding-capable supervisor receives the credential instead of the
         // gateway withholding it as unbound.
         let store = test_store().await;
@@ -9701,7 +9718,7 @@ mod tests {
                 .await
                 .unwrap();
         let cred_inject_bindings = HashMap::from([(
-            "static-provider".to_string(),
+            "API_TOKEN".to_string(),
             vec![StaticCredentialEndpointBinding {
                 host: "mock.opencode.test".to_string(),
                 port: 8443,
@@ -9726,16 +9743,20 @@ mod tests {
                 .static_credential_bindings
                 .get("API_TOKEN")
                 .map(|binding| binding.endpoints.as_slice()),
-            Some(cred_inject_bindings["static-provider"].as_slice())
+            Some(cred_inject_bindings["API_TOKEN"].as_slice())
         );
-        // An unrelated credential_binding for the same provider would still hit
+        // A credential_binding for the same (unprofiled) provider still hits
         // upstream's "no provider profile" rejection — cred_inject does not.
+        let policy_bindings = HashMap::from([(
+            "static-provider".to_string(),
+            cred_inject_bindings["API_TOKEN"].clone(),
+        )]);
         let rejected =
             resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
                 &store,
                 &catalog,
                 &records,
-                &cred_inject_bindings,
+                &policy_bindings,
                 &credentials,
                 None,
             )

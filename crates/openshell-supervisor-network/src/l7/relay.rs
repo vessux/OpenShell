@@ -1705,14 +1705,30 @@ where
                     }
                 }
 
-                let outcome = crate::l7::rest::echo_http_request(
+                let outcome = match crate::l7::rest::echo_http_request(
                     &req_with_auth,
                     client,
                     ctx.secret_resolver.as_deref(),
                     ctx.cred_inject.as_ref(),
                     &ctx.policy_name,
                 )
-                .await?;
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // Fork: an echo failure used to surface only as an empty
+                        // reply to the client (curl exit 52) with nothing in the
+                        // proxy log — undiagnosable from outside the container.
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            policy = %ctx.policy_name,
+                            error = %error,
+                            "echo mode failed; closing connection without a response"
+                        );
+                        return Err(error);
+                    }
+                };
                 match outcome {
                     RelayOutcome::Reusable => {}
                     _ => return Ok(()),
