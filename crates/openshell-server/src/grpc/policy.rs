@@ -1753,6 +1753,78 @@ fn policy_static_credential_endpoint_bindings(
     Ok(bindings)
 }
 
+/// Fork: endpoints that bind a provider by naming it in `cred_inject.provider`.
+/// Same shape as `policy_static_credential_endpoint_bindings`, but kept
+/// separate on purpose: these are NOT run through
+/// `validate_policy_credential_binding_context` (`cred_inject` has its own
+/// validation in `openshell-policy`) and are merged with — never rejected
+/// against — a provider's profile endpoints. Malformed endpoints (empty host,
+/// port 0) are skipped here; policy validation reports them elsewhere.
+fn policy_cred_inject_endpoint_bindings(
+    policy: Option<&ProtoSandboxPolicy>,
+) -> HashMap<String, Vec<StaticCredentialEndpointBinding>> {
+    let mut bindings = HashMap::<String, Vec<StaticCredentialEndpointBinding>>::new();
+    let Some(policy) = policy else {
+        return bindings;
+    };
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            let Some(cred_inject) = endpoint.cred_inject.as_ref() else {
+                continue;
+            };
+            let provider = cred_inject.provider.trim();
+            if provider.is_empty() || endpoint.host.trim().is_empty() {
+                continue;
+            }
+            let ports = if endpoint.ports.is_empty() {
+                vec![endpoint.port]
+            } else {
+                endpoint.ports.clone()
+            };
+            let provider_bindings = bindings.entry(provider.to_string()).or_default();
+            for port in ports {
+                if port == 0 || port > u32::from(u16::MAX) {
+                    continue;
+                }
+                let candidate = StaticCredentialEndpointBinding {
+                    host: endpoint.host.clone(),
+                    port,
+                    path: endpoint.path.clone(),
+                };
+                if !provider_bindings.contains(&candidate) {
+                    provider_bindings.push(candidate);
+                }
+            }
+        }
+    }
+    bindings.retain(|_, endpoints| !endpoints.is_empty());
+    for endpoints in bindings.values_mut() {
+        endpoints.sort_by(|left, right| {
+            (&left.host, left.port, &left.path).cmp(&(&right.host, right.port, &right.path))
+        });
+    }
+    bindings
+}
+
+/// Fork: union of `credential_binding` and `cred_inject` bindings, used only
+/// where both must be visible together (the provider-env revision hash).
+fn merge_policy_bindings(
+    left: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    right: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+) -> HashMap<String, Vec<StaticCredentialEndpointBinding>> {
+    let mut merged = left.clone();
+    for (provider, endpoints) in right {
+        let entry = merged.entry(provider.clone()).or_default();
+        for endpoint in endpoints {
+            if !entry.contains(endpoint) {
+                entry.push(endpoint.clone());
+            }
+        }
+        entry.sort_by(|a, b| (&a.host, a.port, &a.path).cmp(&(&b.host, b.port, &b.path)));
+    }
+    merged
+}
+
 pub(super) fn policy_has_credential_binding_for_provider(
     policy: &ProtoSandboxPolicy,
     provider_name: &str,
@@ -2506,12 +2578,18 @@ pub(super) async fn handle_get_sandbox_config(
         )
         .await?;
     }
+    // Fork: hash the same binding set the supervisor policy fetch uses
+    // (credential_binding + cred_inject), so both revisions agree.
+    let all_policy_bindings = merge_policy_bindings(
+        &policy_credential_bindings,
+        &policy_cred_inject_endpoint_bindings(policy.as_ref()),
+    );
     let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
         state.store.as_ref(),
         &provider_profile_catalog,
         &workspace,
         &sandbox_provider_names,
-        &policy_credential_bindings,
+        &all_policy_bindings,
     )
     .await?;
 
@@ -3076,17 +3154,24 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &effective_policy,
         &policy_credential_bindings,
     )?;
+    // Fork: cred_inject endpoints bind their provider too (see
+    // policy_cred_inject_endpoint_bindings); they take part in the revision
+    // hash and the environment build, not in credential_binding validation.
+    let cred_inject_bindings = policy_cred_inject_endpoint_bindings(Some(&effective_policy));
+    let all_policy_bindings =
+        merge_policy_bindings(&policy_credential_bindings, &cred_inject_bindings);
     let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         &provider_profile_catalog,
         &provider_records,
-        &policy_credential_bindings,
+        &all_policy_bindings,
     )?;
     let mut provider_environment =
-        super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+        super::provider::resolve_provider_environment_from_records_with_policy_and_cred_inject_bindings_and_credentials(
             state.store.as_ref(),
             &provider_profile_catalog,
             &provider_records,
             &policy_credential_bindings,
+            &cred_inject_bindings,
             &state.credentials,
             Some(&sandbox_id),
         )
@@ -8825,6 +8910,78 @@ mod tests {
                 .is_none(),
             "invalid policy must not leave a revision in history"
         );
+    }
+
+    #[test]
+    fn policy_cred_inject_endpoint_bindings_bind_the_named_provider_at_that_endpoint() {
+        // Fork: cred_inject.provider is a binding authority; endpoints without
+        // cred_inject contribute nothing; ports/`ports` and empty hosts handled.
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            "echo".to_string(),
+            NetworkPolicyRule {
+                name: "echo".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "mock.opencode.test".to_string(),
+                        port: 8443,
+                        cred_inject: Some(openshell_core::proto::CredInjectConfig {
+                            provider: "test".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "api.example.test".to_string(),
+                        ports: vec![443, 8443],
+                        path: "/v1/**".to_string(),
+                        cred_inject: Some(openshell_core::proto::CredInjectConfig {
+                            provider: "test".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "plain.example.test".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: String::new(),
+                        port: 443,
+                        cred_inject: Some(openshell_core::proto::CredInjectConfig {
+                            provider: "test".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let bindings = policy_cred_inject_endpoint_bindings(Some(&policy));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings["test"],
+            vec![
+                StaticCredentialEndpointBinding {
+                    host: "api.example.test".to_string(),
+                    port: 443,
+                    path: "/v1/**".to_string(),
+                },
+                StaticCredentialEndpointBinding {
+                    host: "api.example.test".to_string(),
+                    port: 8443,
+                    path: "/v1/**".to_string(),
+                },
+                StaticCredentialEndpointBinding {
+                    host: "mock.opencode.test".to_string(),
+                    port: 8443,
+                    path: String::new(),
+                },
+            ]
+        );
+        assert!(policy_cred_inject_endpoint_bindings(None).is_empty());
     }
 
     #[tokio::test]

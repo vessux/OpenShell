@@ -1070,11 +1070,43 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    credentials: &crate::credentials::CredentialRuntime,
+    sandbox_id: Option<&str>,
+) -> Result<ProviderEnvironment, Status> {
+    resolve_provider_environment_from_records_with_policy_and_cred_inject_bindings_and_credentials(
+        store,
+        catalog,
+        records,
+        policy_bindings,
+        &HashMap::new(),
+        credentials,
+        sandbox_id,
+    )
+    .await
+}
+
+/// Fork: the production builder — `policy_bindings` (upstream `credential_binding`) plus
+/// `cred_inject_bindings`: endpoints the sandbox
+/// policy binds to a provider by naming it in `cred_inject.provider`. Those are
+/// the fork's own explicit declaration, so they are MERGED with the profile /
+/// `credential_binding` endpoints and never trip upstream's
+/// "profile already defines endpoints" / "no provider profile" rejections
+/// (which stay exactly as upstream wrote them for `credential_binding`).
+/// Without this, a binding-capable supervisor never receives the static
+/// credential a `cred_inject` endpoint needs (the gateway withholds unbound
+/// static credentials), so the strip-and-replace fails closed.
+pub(super) async fn resolve_provider_environment_from_records_with_policy_and_cred_inject_bindings_and_credentials(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    cred_inject_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
     credentials: &crate::credentials::CredentialRuntime,
     sandbox_id: Option<&str>,
 ) -> Result<ProviderEnvironment, Status> {
@@ -1139,7 +1171,21 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             }
             (None, None) => None,
         };
-        let has_no_usable_endpoint = effective_endpoints.is_some_and(Vec::is_empty);
+        // Fork: merge cred_inject-declared endpoints for this provider (see fn doc).
+        let effective_endpoints: Option<Vec<StaticCredentialEndpointBinding>> =
+            match (effective_endpoints, cred_inject_bindings.get(name)) {
+                (None, None) => None,
+                (base, extra) => {
+                    let mut merged = base.cloned().unwrap_or_default();
+                    for endpoint in extra.into_iter().flatten() {
+                        if !merged.contains(endpoint) {
+                            merged.push(endpoint.clone());
+                        }
+                    }
+                    Some(merged)
+                }
+            };
+        let has_no_usable_endpoint = effective_endpoints.as_ref().is_some_and(Vec::is_empty);
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
 
         for (key, value) in &provider.credentials {
@@ -1185,7 +1231,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 }
                 provider_env.insert(key.clone(), value.clone());
                 static_credential_keys.insert(key.clone());
-                if let Some(endpoints) = effective_endpoints {
+                if let Some(endpoints) = effective_endpoints.as_deref() {
                     if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
@@ -1244,7 +1290,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 }
                 provider_env.insert(key.clone(), value);
                 static_credential_keys.insert(key.clone());
-                if let Some(endpoints) = effective_endpoints {
+                if let Some(endpoints) = effective_endpoints.as_deref() {
                     if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
@@ -9625,6 +9671,78 @@ mod tests {
                 .get("GCP_ADC_ACCESS_TOKEN")
                 .map(|binding| binding.endpoints.as_slice()),
             Some(policy_bindings["my-google-cloud"].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_cred_inject_binding_binds_unprofiled_static_provider() {
+        // Fork: a cred_inject endpoint naming an unprofiled provider is a
+        // binding for that provider's static credentials at that endpoint, so
+        // a binding-capable supervisor receives the credential instead of the
+        // gateway withholding it as unbound.
+        let store = test_store().await;
+        let credentials = crate::credentials::CredentialRuntime::from_config(
+            &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        create_provider_record(
+            &store,
+            "default",
+            provider_with_values("static-provider", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+        let records =
+            load_provider_environment_records(&store, "default", &["static-provider".to_string()])
+                .await
+                .unwrap();
+        let cred_inject_bindings = HashMap::from([(
+            "static-provider".to_string(),
+            vec![StaticCredentialEndpointBinding {
+                host: "mock.opencode.test".to_string(),
+                port: 8443,
+                path: String::new(),
+            }],
+        )]);
+        let bound =
+            resolve_provider_environment_from_records_with_policy_and_cred_inject_bindings_and_credentials(
+                &store,
+                &catalog,
+                &records,
+                &HashMap::new(),
+                &cred_inject_bindings,
+                &credentials,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.get("API_TOKEN"), Some(&"token-123".to_string()));
+        assert_eq!(
+            bound
+                .static_credential_bindings
+                .get("API_TOKEN")
+                .map(|binding| binding.endpoints.as_slice()),
+            Some(cred_inject_bindings["static-provider"].as_slice())
+        );
+        // An unrelated credential_binding for the same provider would still hit
+        // upstream's "no provider profile" rejection — cred_inject does not.
+        let rejected =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                &store,
+                &catalog,
+                &records,
+                &cred_inject_bindings,
+                &credentials,
+                None,
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "credential_binding on an unprofiled provider must still be rejected"
         );
     }
 
