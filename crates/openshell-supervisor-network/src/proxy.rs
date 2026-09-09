@@ -2015,7 +2015,14 @@ async fn handle_tcp_connection(
             .as_ref()
             .map(|ctx| ctx.workspace())
             .unwrap_or_default();
-        let ctx = crate::l7::relay::L7EvalContext {
+        // `request_default_port` is set per detected transport below (443 for
+        // TLS, 80 for plaintext), exactly like the non-echo CONNECT path: upstream's
+        // request-authority check (`request_authority_matches_endpoint`) treats
+        // an UNSET transport default as an error, not as "no default", so leaving
+        // it `None` here refused every echo request with
+        // `request_authority_mismatch` (fork v0.9.0 regression, caught by the
+        // openlock live legs).
+        let mut ctx = crate::l7::relay::L7EvalContext {
             host: host_lc.clone(),
             port,
             workspace,
@@ -2084,6 +2091,7 @@ async fn handle_tcp_connection(
             let l7_config = &route.configs[0].config;
             if crate::l7::tls::looks_like_tls(&peek_buf[..n]) {
                 if let Some(ref tls) = tls_state {
+                    ctx.request_default_port = Some(443);
                     let mut tls_client =
                         crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
                     let _ = crate::l7::relay::relay_with_inspection(
@@ -2096,6 +2104,7 @@ async fn handle_tcp_connection(
                     .await;
                 }
             } else {
+                ctx.request_default_port = Some(80);
                 let _ = crate::l7::relay::relay_with_inspection(
                     l7_config,
                     tunnel_engine,
